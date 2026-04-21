@@ -33,8 +33,10 @@ from scripts.asr.render import (
 )
 from scripts.media_subtitle import (
     AudioPreprocessOptions,
+    ClipRangeOptions,
     analyze_srt_timing,
     build_audio_preprocess_command,
+    build_video_clip_command,
     assert_srt_timing_healthy,
     build_srt_entries_from_line_entries,
     build_burn_command,
@@ -48,11 +50,15 @@ from scripts.media_subtitle import (
     ensure_subtitle_filter_available,
     chunk_srt_entries_for_translation,
     parse_srt,
+    parse_timecode,
+    probe_media_duration,
     resolve_tool_path,
     seconds_to_srt_timestamp,
     split_lines_json,
     split_translated_chunk,
     validate_audio_preprocess_options,
+    validate_clip_range_against_duration,
+    validate_clip_range_options,
     validate_max_chars,
     write_srt,
 )
@@ -235,6 +241,7 @@ class AudioPreprocessCommandTests(unittest.TestCase):
             output_path="/tmp/output.wav",
             source_is_video=False,
             options=AudioPreprocessOptions(),
+            clip_range=ClipRangeOptions(),
         )
 
         self.assertEqual(command[:4], ["/opt/homebrew/bin/ffmpeg", "-y", "-i", "/tmp/input.mp3"])
@@ -252,6 +259,7 @@ class AudioPreprocessCommandTests(unittest.TestCase):
             output_path="/tmp/output.wav",
             source_is_video=True,
             options=AudioPreprocessOptions(normalize_audio=True, trim_silence=True),
+            clip_range=ClipRangeOptions(),
         )
 
         self.assertIn("-vn", command)
@@ -263,6 +271,62 @@ class AudioPreprocessCommandTests(unittest.TestCase):
     def test_validate_audio_preprocess_options_rejects_trim_silence(self) -> None:
         with self.assertRaisesRegex(Exception, "trim-silence"):
             validate_audio_preprocess_options(AudioPreprocessOptions(trim_silence=True))
+
+    def test_builds_audio_preprocess_command_with_clip_start_end(self) -> None:
+        command = build_audio_preprocess_command(
+            ffmpeg_bin="/opt/homebrew/bin/ffmpeg",
+            input_path="/tmp/input.mp3",
+            output_path="/tmp/output.wav",
+            source_is_video=False,
+            options=AudioPreprocessOptions(),
+            clip_range=ClipRangeOptions(start_seconds=10.0, end_seconds=20.5),
+        )
+
+        self.assertIn("-ss", command)
+        self.assertIn("00:00:10.000", command)
+        self.assertIn("-to", command)
+        self.assertIn("00:00:20.500", command)
+
+    def test_builds_video_clip_command_with_duration(self) -> None:
+        command = build_video_clip_command(
+            ffmpeg_bin="/opt/homebrew/bin/ffmpeg",
+            input_path="/tmp/input.mp4",
+            output_path="/tmp/clip.mp4",
+            clip_range=ClipRangeOptions(start_seconds=30.0, duration_seconds=12.0),
+        )
+
+        self.assertEqual(command[:4], ["/opt/homebrew/bin/ffmpeg", "-y", "-i", "/tmp/input.mp4"])
+        self.assertIn("-ss", command)
+        self.assertIn("00:00:30.000", command)
+        self.assertIn("-t", command)
+        self.assertIn("00:00:12.000", command)
+
+
+class ClipRangeTests(unittest.TestCase):
+    def test_parse_timecode_supports_mm_ss(self) -> None:
+        self.assertEqual(parse_timecode("23:10"), 1390.0)
+
+    def test_parse_timecode_supports_hh_mm_ss(self) -> None:
+        self.assertEqual(parse_timecode("00:29:30"), 1770.0)
+
+    def test_validate_clip_range_rejects_end_and_duration(self) -> None:
+        with self.assertRaisesRegex(Exception, "不能同时传"):
+            validate_clip_range_options(
+                ClipRangeOptions(start_seconds=10.0, end_seconds=20.0, duration_seconds=5.0)
+            )
+
+    def test_validate_clip_range_rejects_end_before_start(self) -> None:
+        with self.assertRaisesRegex(Exception, "必须大于"):
+            validate_clip_range_options(
+                ClipRangeOptions(start_seconds=20.0, end_seconds=10.0)
+            )
+
+    def test_validate_clip_range_against_duration_rejects_start_out_of_bounds(self) -> None:
+        with self.assertRaisesRegex(Exception, "超出了媒体总时长"):
+            validate_clip_range_against_duration(
+                ClipRangeOptions(start_seconds=30.0),
+                media_duration=20.0,
+            )
 
 
 class SrtTranslationTests(unittest.TestCase):
@@ -787,6 +851,14 @@ class ParserTests(unittest.TestCase):
         args = parser.parse_args(["run", "input.mp3", "--timing-mode", "experimental_segment_align"])
 
         self.assertEqual(args.timing_mode, "experimental_segment_align")
+
+    def test_run_parser_supports_clip_range(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["run", "input.mp4", "--start", "23:10", "--end", "29:30"])
+
+        self.assertEqual(args.start, 1390.0)
+        self.assertEqual(args.end, 1770.0)
 
     def test_burn_parser_accepts_video_and_subtitle(self) -> None:
         parser = build_parser()

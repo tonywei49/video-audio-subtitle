@@ -118,6 +118,13 @@ class AudioPreprocessOptions:
     trim_silence: bool = False
 
 
+@dataclass(frozen=True)
+class ClipRangeOptions:
+    start_seconds: float | None = None
+    end_seconds: float | None = None
+    duration_seconds: float | None = None
+
+
 def _parse_srt_timestamp(timestamp: str) -> int:
     hours, minutes, seconds_millis = timestamp.split(":")
     seconds, millis = seconds_millis.split(",")
@@ -138,6 +145,39 @@ def seconds_to_srt_timestamp(seconds_value: float) -> str:
     seconds = remainder // 1000
     millis = remainder % 1000
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def parse_timecode(value: str) -> float:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("时间参数不能为空。")
+    parts = raw.split(":")
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600 + minutes * 60 + seconds
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60 + seconds
+        if len(parts) == 1:
+            return float(parts[0])
+    except ValueError as exc:
+        raise ValueError(f"无法解析时间参数: {value}") from exc
+    raise ValueError(f"无法解析时间参数: {value}")
+
+
+def _format_ffmpeg_timestamp(seconds_value: float) -> str:
+    total_ms = max(0, int(round(seconds_value * 1000)))
+    hours = total_ms // 3_600_000
+    remainder = total_ms % 3_600_000
+    minutes = remainder // 60_000
+    remainder %= 60_000
+    seconds = remainder // 1000
+    millis = remainder % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
 def classify_source(source: str) -> SourceInfo:
@@ -244,6 +284,30 @@ def resolve_tool_path(command: str, *, required: bool = True) -> str | None:
 
 def _command_exists(command: str) -> bool:
     return resolve_tool_path(command, required=False) is not None
+
+
+def probe_media_duration(path: str) -> float:
+    ffprobe_bin = resolve_tool_path("ffprobe")
+    probe = subprocess.run(
+        [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        raise SkillError(f"无法读取媒体时长: {path}")
+    try:
+        return float(probe.stdout.strip())
+    except ValueError as exc:
+        raise SkillError(f"无法解析媒体时长: {path}") from exc
 
 
 def _skill_venv_python(*, required: bool = False) -> pathlib.Path | None:
@@ -387,6 +451,7 @@ def build_audio_preprocess_command(
     output_path: str,
     source_is_video: bool,
     options: AudioPreprocessOptions,
+    clip_range: ClipRangeOptions,
 ) -> list[str]:
     command = [
         ffmpeg_bin,
@@ -394,6 +459,12 @@ def build_audio_preprocess_command(
         "-i",
         input_path,
     ]
+    if clip_range.start_seconds is not None:
+        command.extend(["-ss", _format_ffmpeg_timestamp(clip_range.start_seconds)])
+    if clip_range.end_seconds is not None:
+        command.extend(["-to", _format_ffmpeg_timestamp(clip_range.end_seconds)])
+    elif clip_range.duration_seconds is not None:
+        command.extend(["-t", _format_ffmpeg_timestamp(clip_range.duration_seconds)])
     if source_is_video:
         command.append("-vn")
 
@@ -423,11 +494,85 @@ def build_audio_preprocess_command(
     return command
 
 
+def build_video_clip_command(
+    *,
+    ffmpeg_bin: str,
+    input_path: str,
+    output_path: str,
+    clip_range: ClipRangeOptions,
+) -> list[str]:
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        input_path,
+    ]
+    if clip_range.start_seconds is not None:
+        command.extend(["-ss", _format_ffmpeg_timestamp(clip_range.start_seconds)])
+    if clip_range.end_seconds is not None:
+        command.extend(["-to", _format_ffmpeg_timestamp(clip_range.end_seconds)])
+    elif clip_range.duration_seconds is not None:
+        command.extend(["-t", _format_ffmpeg_timestamp(clip_range.duration_seconds)])
+    command.extend(
+        [
+            "-c",
+            "copy",
+            output_path,
+        ]
+    )
+    return command
+
+
 def validate_audio_preprocess_options(options: AudioPreprocessOptions) -> None:
     if options.trim_silence:
         raise SkillError(
             "`--trim-silence` 当前未安全支持：它会改变字幕时间基准，"
             "而现有实现已在真实样本上出现过度裁切。为保证稳定性，当前版本直接阻断，不做隐式回退。"
+        )
+
+
+def validate_clip_range_options(options: ClipRangeOptions) -> None:
+    values = [options.start_seconds, options.end_seconds, options.duration_seconds]
+    if all(value is None for value in values):
+        return
+    for name, value in (
+        ("start", options.start_seconds),
+        ("end", options.end_seconds),
+        ("duration", options.duration_seconds),
+    ):
+        if value is not None and value < 0:
+            raise SkillError(f"`--{name}` 不能是负数。")
+    if options.end_seconds is not None and options.duration_seconds is not None:
+        raise SkillError("`--end` 和 `--duration` 不能同时传，必须二选一。")
+    if (
+        options.start_seconds is not None
+        and options.end_seconds is not None
+        and options.end_seconds <= options.start_seconds
+    ):
+        raise SkillError("`--end` 必须大于 `--start`。")
+    if options.duration_seconds is not None and options.duration_seconds <= 0:
+        raise SkillError("`--duration` 必须大于 0。")
+
+
+def validate_clip_range_against_duration(options: ClipRangeOptions, media_duration: float) -> None:
+    if all(value is None for value in (options.start_seconds, options.end_seconds, options.duration_seconds)):
+        return
+    if options.start_seconds is not None and options.start_seconds >= media_duration:
+        raise SkillError(
+            f"`--start` ({options.start_seconds:.2f}s) 超出了媒体总时长 ({media_duration:.2f}s)。"
+        )
+    if options.end_seconds is not None and options.end_seconds > media_duration + 1e-3:
+        raise SkillError(
+            f"`--end` ({options.end_seconds:.2f}s) 超出了媒体总时长 ({media_duration:.2f}s)。"
+        )
+    if (
+        options.start_seconds is not None
+        and options.duration_seconds is not None
+        and options.start_seconds + options.duration_seconds > media_duration + 1e-3
+    ):
+        raise SkillError(
+            "`--start + --duration` 超出了媒体总时长 "
+            f"({media_duration:.2f}s)。"
         )
 
 
@@ -811,12 +956,14 @@ def _prepare_audio_input(
     yt_dlp_cookies_from_browser: str | None,
     keep_video: bool,
     audio_preprocess: AudioPreprocessOptions,
+    clip_range: ClipRangeOptions,
 ) -> PreparedMedia:
     work_dir = run_dir / "work"
     work_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = resolve_tool_path("ffmpeg")
 
     if source.kind == "audio_file":
+        validate_clip_range_against_duration(clip_range, probe_media_duration(str(source.resolved_path)))
         output_audio = work_dir / "source.wav"
         _run_command(
             build_audio_preprocess_command(
@@ -825,24 +972,43 @@ def _prepare_audio_input(
                 output_path=str(output_audio),
                 source_is_video=False,
                 options=audio_preprocess,
+                clip_range=clip_range,
             )
         )
         return PreparedMedia(audio_path=output_audio)
 
     if source.kind == "video_file":
+        video_input_path = pathlib.Path(source.resolved_path)
+        validate_clip_range_against_duration(clip_range, probe_media_duration(str(video_input_path)))
+        prepared_video_path = video_input_path
+        if any(
+            value is not None
+            for value in (clip_range.start_seconds, clip_range.end_seconds, clip_range.duration_seconds)
+        ):
+            clipped_video = work_dir / f"source-video{video_input_path.suffix.lower() or '.mp4'}"
+            _run_command(
+                build_video_clip_command(
+                    ffmpeg_bin=ffmpeg_bin,
+                    input_path=str(video_input_path),
+                    output_path=str(clipped_video),
+                    clip_range=clip_range,
+                )
+            )
+            prepared_video_path = clipped_video
         output_audio = work_dir / "source.wav"
         _run_command(
             build_audio_preprocess_command(
                 ffmpeg_bin=ffmpeg_bin,
-                input_path=str(source.resolved_path),
+                input_path=str(prepared_video_path),
                 output_path=str(output_audio),
                 source_is_video=True,
                 options=audio_preprocess,
+                clip_range=ClipRangeOptions(),
             )
         )
         return PreparedMedia(
             audio_path=output_audio,
-            video_path=pathlib.Path(source.resolved_path),
+            video_path=prepared_video_path,
         )
 
     if source.kind in REMOTE_VIDEO_KINDS:
@@ -860,6 +1026,7 @@ def _prepare_audio_input(
         output_audio = work_dir / "source.wav"
         if not downloaded_audio.exists():
             raise SkillError("yt-dlp 执行后未产出 source-download.wav，无法继续 ASR。")
+        validate_clip_range_against_duration(clip_range, probe_media_duration(str(downloaded_audio)))
         _run_command(
             build_audio_preprocess_command(
                 ffmpeg_bin=ffmpeg_bin,
@@ -867,6 +1034,7 @@ def _prepare_audio_input(
                 output_path=str(output_audio),
                 source_is_video=False,
                 options=audio_preprocess,
+                clip_range=clip_range,
             )
         )
         video_path: pathlib.Path | None = None
@@ -885,6 +1053,20 @@ def _prepare_audio_input(
             video_path = next((path for path in video_candidates if path.suffix.lower() in VIDEO_EXTENSIONS), None)
             if video_path is None:
                 raise SkillError("已要求保留远程视频，但 yt-dlp 执行后没有产出可用视频文件。")
+            if any(
+                value is not None
+                for value in (clip_range.start_seconds, clip_range.end_seconds, clip_range.duration_seconds)
+            ):
+                clipped_video = work_dir / f"source-video-clipped{video_path.suffix.lower()}"
+                _run_command(
+                    build_video_clip_command(
+                        ffmpeg_bin=ffmpeg_bin,
+                        input_path=str(video_path),
+                        output_path=str(clipped_video),
+                        clip_range=clip_range,
+                    )
+                )
+                video_path = clipped_video
         return PreparedMedia(audio_path=output_audio, video_path=video_path)
 
     raise SkillError(f"未知输入类型: {source.kind}")
@@ -988,6 +1170,9 @@ def execute_pipeline(
     timing_mode: str = "stable",
     normalize_audio: bool = False,
     trim_silence: bool = False,
+    clip_start: float | None = None,
+    clip_end: float | None = None,
+    clip_duration: float | None = None,
     install_missing: bool = False,
     yt_dlp_cookies_file: str | None = None,
     yt_dlp_cookies_from_browser: str | None = None,
@@ -1022,7 +1207,13 @@ def execute_pipeline(
         normalize_audio=normalize_audio,
         trim_silence=trim_silence,
     )
+    clip_range = ClipRangeOptions(
+        start_seconds=clip_start,
+        end_seconds=clip_end,
+        duration_seconds=clip_duration,
+    )
     validate_audio_preprocess_options(audio_preprocess)
+    validate_clip_range_options(clip_range)
     prepared_media = _prepare_audio_input(
         check.source,
         run_dir,
@@ -1030,6 +1221,7 @@ def execute_pipeline(
         yt_dlp_cookies_from_browser=yt_dlp_cookies_from_browser,
         keep_video=keep_video,
         audio_preprocess=audio_preprocess,
+        clip_range=clip_range,
     )
     outputs = _run_local_asr(
         prepared_media.audio_path,
@@ -1048,6 +1240,7 @@ def execute_pipeline(
         "max_chars": max_chars,
         "timing_mode": timing_mode,
         "audio_preprocess": asdict(audio_preprocess),
+        "clip_range": asdict(clip_range),
         "outputs": outputs["paths"],
         "quality_summary": outputs["quality_summary"],
     }
@@ -1225,6 +1418,9 @@ def _run_command_entry(args: argparse.Namespace) -> int:
         timing_mode=args.timing_mode,
         normalize_audio=args.normalize_audio,
         trim_silence=args.trim_silence,
+        clip_start=args.start,
+        clip_end=args.end,
+        clip_duration=args.duration,
         install_missing=args.install_missing,
         yt_dlp_cookies_file=args.yt_dlp_cookies,
         yt_dlp_cookies_from_browser=args.yt_dlp_cookies_from_browser,
@@ -1325,6 +1521,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="显式裁掉首尾静音；会改变输入音频边界，默认关闭。",
     )
+    run_parser.add_argument("--start", type=parse_timecode, default=None, help="可选裁切起点，例如 23:10 或 00:23:10")
+    run_parser.add_argument("--end", type=parse_timecode, default=None, help="可选裁切终点，例如 29:30 或 00:29:30")
+    run_parser.add_argument("--duration", type=parse_timecode, default=None, help="可选裁切时长，例如 06:20 或 00:06:20；不能与 --end 同时传")
     run_parser.add_argument("--yt-dlp-cookies", default=None)
     run_parser.add_argument("--yt-dlp-cookies-from-browser", default=None)
     run_parser.add_argument(
