@@ -1,13 +1,31 @@
+import json
 import pathlib
 from unittest import mock
 import sys
 import tempfile
 import unittest
+import os
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.shared import config as shared_config
+from scripts.shared import model_path as shared_model_path
+from scripts.shared import platform as shared_platform
+from scripts.asr import engine as standalone_engine
+from scripts.asr.pipeline import (
+    SubtitleLine as StandaloneSubtitleLine,
+    _build_paragraphs as standalone_build_paragraphs,
+    _smart_split as standalone_smart_split,
+    split_line_after as standalone_split_line_after,
+    stage_check as standalone_stage_check,
+)
+from scripts.asr.render import (
+    ASSSubtitleStyle as StandaloneASSSubtitleStyle,
+    format_ass_time as standalone_format_ass_time,
+    format_srt_time as standalone_format_srt_time,
+)
 from scripts.media_subtitle import (
     analyze_srt_timing,
     assert_srt_timing_healthy,
@@ -25,6 +43,7 @@ from scripts.media_subtitle import (
     parse_srt,
     resolve_tool_path,
     seconds_to_srt_timestamp,
+    split_lines_json,
     split_translated_chunk,
     validate_max_chars,
     write_srt,
@@ -75,7 +94,7 @@ class InstallActionTests(unittest.TestCase):
     def test_audio_input_does_not_require_ffmpeg_or_ytdlp(self) -> None:
         actions = build_install_actions(
             missing_tools=["uv"],
-            opc_needs_sync=True,
+            python_deps_ready=False,
             source_kind="audio_file",
             platform_name="macos",
             brew_available=True,
@@ -85,14 +104,14 @@ class InstallActionTests(unittest.TestCase):
             actions,
             [
                 "brew install uv",
-                "在 OPC 仓库执行 uv sync 安装 Python 依赖",
+                "在当前 skill 目录执行 uv sync 安装 Python 依赖",
             ],
         )
 
     def test_video_input_requires_ffmpeg(self) -> None:
         actions = build_install_actions(
             missing_tools=["ffmpeg", "ffprobe"],
-            opc_needs_sync=False,
+            python_deps_ready=True,
             source_kind="video_file",
             platform_name="macos",
             brew_available=True,
@@ -103,7 +122,7 @@ class InstallActionTests(unittest.TestCase):
     def test_youtube_input_requires_ytdlp(self) -> None:
         actions = build_install_actions(
             missing_tools=["ffmpeg", "ffprobe", "yt-dlp"],
-            opc_needs_sync=False,
+            python_deps_ready=True,
             source_kind="youtube_url",
             platform_name="macos",
             brew_available=True,
@@ -114,7 +133,7 @@ class InstallActionTests(unittest.TestCase):
     def test_bilibili_input_requires_ytdlp(self) -> None:
         actions = build_install_actions(
             missing_tools=["ffmpeg", "ffprobe", "yt-dlp"],
-            opc_needs_sync=False,
+            python_deps_ready=True,
             source_kind="bilibili_url",
             platform_name="macos",
             brew_available=True,
@@ -125,7 +144,7 @@ class InstallActionTests(unittest.TestCase):
     def test_tiktok_input_requires_ytdlp(self) -> None:
         actions = build_install_actions(
             missing_tools=["ffmpeg", "ffprobe", "yt-dlp"],
-            opc_needs_sync=False,
+            python_deps_ready=True,
             source_kind="tiktok_url",
             platform_name="macos",
             brew_available=True,
@@ -360,6 +379,226 @@ class ToolResolutionTests(unittest.TestCase):
             self.assertEqual(resolve_tool_path("ffmpeg"), "/opt/homebrew/bin/ffmpeg")
 
 
+class SharedConfigTests(unittest.TestCase):
+    def test_loads_default_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {"VIDEO_AUDIO_SUBTITLE_CONFIG_DIR": tmpdir},
+            clear=False,
+        ):
+            config = shared_config.load_config()
+
+        self.assertEqual(config["asr_model_size"], "0.6B")
+        self.assertEqual(config["model_source"], "modelscope")
+
+    def test_save_and_reload_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {"VIDEO_AUDIO_SUBTITLE_CONFIG_DIR": tmpdir},
+            clear=False,
+        ):
+            shared_config.save_config("backend", "mlx")
+            config = shared_config.load_config()
+
+        self.assertEqual(config["backend"], "mlx")
+
+
+class SharedPlatformTests(unittest.TestCase):
+    def test_auto_detects_mlx_on_macos(self) -> None:
+        with mock.patch("platform.system", return_value="Darwin"):
+            self.assertEqual(shared_platform._auto_detect_backend(), "mlx")
+
+    def test_get_backend_uses_config_override(self) -> None:
+        with mock.patch("scripts.shared.config.load_config", return_value={"backend": "cuda"}):
+            self.assertEqual(shared_platform.get_backend(), "cuda")
+
+
+class SharedModelPathTests(unittest.TestCase):
+    def test_prefers_local_model_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(shared_model_path.resolve_model_path(tmpdir), tmpdir)
+
+    def test_modelscope_cache_path_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch(
+            "scripts.shared.model_path.load_config",
+            return_value={"model_source": "modelscope", "model_cache_dir": tmpdir},
+        ):
+            model_dir = pathlib.Path(tmpdir) / "models" / "Qwen" / "Qwen3-ASR-0___6B"
+            model_dir.mkdir(parents=True)
+            self.assertTrue(shared_model_path.check_model_exists("Qwen/Qwen3-ASR-0.6B"))
+
+    def test_huggingface_cache_path_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch(
+            "scripts.shared.model_path.load_config",
+            return_value={"model_source": "huggingface", "model_cache_dir": tmpdir},
+        ):
+            model_dir = pathlib.Path(tmpdir) / "hub" / "models--mlx-community--Qwen3-ASR-0.6B-8bit"
+            model_dir.mkdir(parents=True)
+            self.assertTrue(shared_model_path.check_model_exists("mlx-community/Qwen3-ASR-0.6B-8bit"))
+
+
+class StandaloneAsrPipelineTests(unittest.TestCase):
+    def test_builds_paragraphs_by_sentence_end(self) -> None:
+        paragraphs = standalone_build_paragraphs(
+            [
+                {"text": "Hello", "start_time": 0.0, "end_time": 0.5},
+                {"text": " world.", "start_time": 0.5, "end_time": 1.0},
+                {"text": "Next", "start_time": 1.2, "end_time": 1.6},
+            ]
+        )
+
+        self.assertEqual(len(paragraphs), 2)
+        self.assertEqual(paragraphs[0].text, "Hello world.")
+
+    def test_smart_split_breaks_long_segment(self) -> None:
+        lines = standalone_smart_split(
+            [
+                {"text": "This ", "start_time": 0.0, "end_time": 0.2},
+                {"text": "is ", "start_time": 0.2, "end_time": 0.4},
+                {"text": "a ", "start_time": 0.4, "end_time": 0.6},
+                {"text": "long ", "start_time": 0.9, "end_time": 1.2},
+                {"text": "line", "start_time": 1.2, "end_time": 1.5},
+            ],
+            max_chars=3,
+        )
+
+        self.assertGreaterEqual(len(lines), 2)
+
+    def test_split_line_after_splits_unique_text(self) -> None:
+        lines = [
+            StandaloneSubtitleLine(
+                text="Hello world",
+                start_time=0.0,
+                end_time=1.0,
+                words=[
+                    {"text": "Hello ", "start_time": 0.0, "end_time": 0.4},
+                    {"text": "world", "start_time": 0.4, "end_time": 1.0},
+                ],
+            )
+        ]
+
+        result = standalone_split_line_after(lines, 1, "Hello ")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].text, "Hello ")
+        self.assertEqual(result[1].text, "world")
+
+    def test_stage_check_reports_long_line(self) -> None:
+        errors = standalone_stage_check(
+            [StandaloneSubtitleLine(text="這是一個非常非常長的字幕行", start_time=0.0, end_time=1.0)],
+            max_chars=4,
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].checker, "max_chars")
+        self.assertIn("media_subtitle.py split", errors[0].fix_command)
+
+
+class StandaloneAsrRenderTests(unittest.TestCase):
+    def test_formats_ass_time(self) -> None:
+        self.assertEqual(standalone_format_ass_time(65.43), "0:01:05.43")
+
+    def test_formats_srt_time(self) -> None:
+        self.assertEqual(standalone_format_srt_time(65.432), "00:01:05,432")
+
+    def test_ass_style_lookup(self) -> None:
+        style = StandaloneASSSubtitleStyle.from_name("default")
+        self.assertIn("Style:", style.to_header())
+
+
+class StandaloneAsrEngineTests(unittest.TestCase):
+    def test_mlx_align_matches_original_two_stage_flow(self) -> None:
+        class FakeAsrResult:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class FakeAlignItem:
+            def __init__(self, text: str, start_time: float, end_time: float) -> None:
+                self.text = text
+                self.start_time = start_time
+                self.end_time = end_time
+
+        class FakeAsrModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def generate(self, audio, language=None, verbose=False):
+                self.calls.append(audio)
+                return FakeAsrResult("Hello ")
+
+        class FakeAlignerModel:
+            def generate(self, audio, text, language=None):
+                return [FakeAlignItem(text, 0.0, 1.0)]
+
+        wav = [0.0] * (31 * 16000)  # 31 秒，分成两块
+        asr_model = FakeAsrModel()
+        result = standalone_engine._asr_align_mlx(
+            asr_model,
+            FakeAlignerModel(),
+            "/tmp/sample.wav",
+            wav,
+            16000,
+            31.0,
+            "English",
+        )
+
+        self.assertEqual(len(asr_model.calls), 3)
+        self.assertIsInstance(asr_model.calls[0], str)
+        self.assertTrue(all(not isinstance(call, str) for call in asr_model.calls[1:]))
+        self.assertEqual(result.text, "Hello Hello ")
+
+    def test_segment_text_to_words_preserves_text(self) -> None:
+        words = standalone_engine._segment_text_to_words("Hello world. Next line.", 0.0, 4.0)
+        self.assertEqual("".join(word.text for word in words), "Hello world. Next line.")
+        self.assertEqual(words[0].start_time, 0.0)
+        self.assertEqual(words[-1].end_time, 4.0)
+
+    def test_segment_text_to_words_splits_pure_cjk_runs(self) -> None:
+        words = standalone_engine._segment_text_to_words("哈哈哈哈", 0.0, 4.0)
+        self.assertEqual("".join(word.text for word in words), "哈哈哈哈")
+        self.assertEqual(len(words), 4)
+        self.assertTrue(all(word.end_time > word.start_time for word in words))
+
+    def test_segments_to_word_timestamps_expands_multiple_segments(self) -> None:
+        words = standalone_engine._segments_to_word_timestamps(
+            [
+                {"text": "Hello world. ", "start": 0.0, "end": 2.0},
+                {"text": "Second line.", "start": 2.0, "end": 4.0},
+            ]
+        )
+        self.assertEqual("".join(word.text for word in words), "Hello world. Second line.")
+        self.assertEqual(words[0].start_time, 0.0)
+        self.assertEqual(words[-1].end_time, 4.0)
+
+    def test_mlx_long_audio_path_uses_segments_without_aligner(self) -> None:
+        class FakeResult:
+            def __init__(self) -> None:
+                self.text = "Hello world. Second line."
+                self.segments = [
+                    {"text": "Hello world. ", "start": 0.0, "end": 2.0},
+                    {"text": "Second line.", "start": 2.0, "end": 4.0},
+                ]
+
+        class FakeAsrModel:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def generate(self, audio, **kwargs):
+                self.calls.append((audio, kwargs))
+                return FakeResult()
+
+        with mock.patch("scripts.asr.engine.get_backend", return_value="mlx"), mock.patch(
+            "scripts.asr.engine.get_asr_model",
+            return_value={"asr": FakeAsrModel()},
+        ) as get_model_mock, mock.patch(
+            "scripts.asr.engine.load_audio",
+            return_value=([0.0] * int(301 * 16000), 16000),
+        ):
+            result = standalone_engine.asr_align("/tmp/sample.wav", language="English", model_size="0.6B")
+
+        self.assertTrue(result.words)
+        self.assertEqual(result.text, "Hello world. Second line.")
+        get_model_mock.assert_called_once_with("mlx-community/Qwen3-ASR-0.6B-8bit", with_aligner=False)
+
+
 class ParserTests(unittest.TestCase):
     def test_run_parser_supports_max_chars(self) -> None:
         parser = build_parser()
@@ -397,6 +636,34 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual(args.subtitle, "subtitle.srt")
         self.assertEqual(args.target_language, "zh-CN")
+
+    def test_split_parser_accepts_lines_json_and_position(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["split", "sample.lines.json", "--line", "3", "--after", "Hello "])
+
+        self.assertEqual(args.lines_json, "sample.lines.json")
+        self.assertEqual(args.line, 3)
+        self.assertEqual(args.after, "Hello ")
+
+
+class SplitLinesJsonTests(unittest.TestCase):
+    def test_split_lines_json_overwrites_input_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lines_path = pathlib.Path(tmpdir) / "sample.lines.json"
+            lines_path.write_text(
+                '[{"text":"Hello world","start_time":0.0,"end_time":1.0,"words":[{"text":"Hello ","start_time":0.0,"end_time":0.4},{"text":"world","start_time":0.4,"end_time":1.0}],"pause_after":0.0}]',
+                encoding="utf-8",
+            )
+
+            result = split_lines_json(str(lines_path), line=1, after="Hello ")
+
+            updated = json.loads(lines_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(pathlib.Path(result["output_lines_json"]).resolve(), lines_path.resolve())
+        self.assertEqual(len(updated), 2)
+        self.assertEqual(updated[0]["text"], "Hello ")
+        self.assertEqual(updated[1]["text"], "world")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,14 @@ from urllib import request as urllib_request
 from urllib import error as urllib_error
 from urllib.parse import urlparse
 
+SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
+SKILL_ROOT = SCRIPT_ROOT.parent
+if str(SKILL_ROOT) not in sys.path:
+    sys.path.insert(0, str(SKILL_ROOT))
+
+from scripts.asr.pipeline import _load_lines, _save_lines, run_pipeline, split_line_after
+from scripts.shared.model_path import get_model_source
+from scripts.shared.platform import check_dependency_available, get_backend
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -53,9 +61,6 @@ PREFERRED_TOOL_PATHS = {
         pathlib.Path("/opt/homebrew/opt/ffmpeg-full/bin/ffprobe"),
     ],
 }
-SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
-SKILL_ROOT = SCRIPT_ROOT.parent
-DEFAULT_OPC_ROOT = pathlib.Path("/Users/mac/Documents/github资源/OPC/opc-cli")
 
 
 class SkillError(RuntimeError):
@@ -90,8 +95,7 @@ class CheckResult:
     source: SourceInfo
     platform: PlatformInfo
     missing_tools: list[str]
-    opc_root: str
-    opc_needs_sync: bool
+    python_deps_ready: bool
     install_actions: list[str]
 
 
@@ -236,24 +240,40 @@ def _command_exists(command: str) -> bool:
     return resolve_tool_path(command, required=False) is not None
 
 
-def _opc_needs_sync(opc_root: pathlib.Path) -> bool:
-    venv_python = opc_root / ".venv" / "bin" / "python"
-    if not venv_python.exists():
-        return True
+def _skill_venv_python(*, required: bool = False) -> pathlib.Path | None:
+    candidate = SKILL_ROOT / ".venv" / "bin" / "python"
+    if candidate.exists():
+        return candidate
+    if required:
+        raise SkillError("当前 skill 还没有完成 `uv sync`，找不到 .venv/bin/python。")
+    return None
+
+
+def _python_deps_ready() -> bool:
+    venv_python = _skill_venv_python(required=False)
+    if venv_python is None:
+        return False
+
+    backend = get_backend()
+    probe_backend = "import mlx_audio" if backend == "mlx" else "import torch"
+    probe_modules = ["import soundfile", probe_backend]
+    if get_model_source() == "huggingface":
+        probe_modules.append("import huggingface_hub")
+    else:
+        probe_modules.append("import modelscope")
 
     probe = subprocess.run(
-        [str(venv_python), "-c", "import scripts.opc"],
-        cwd=opc_root,
+        [str(venv_python), "-c", "; ".join(probe_modules)],
         capture_output=True,
         text=True,
     )
-    return probe.returncode != 0
+    return probe.returncode == 0
 
 
 def build_install_actions(
     *,
     missing_tools: list[str],
-    opc_needs_sync: bool,
+    python_deps_ready: bool,
     source_kind: str,
     platform_name: str,
     brew_available: bool,
@@ -276,19 +296,15 @@ def build_install_actions(
         if missing_tools:
             actions.append(f"当前平台未实现自动安装: {', '.join(missing_tools)}")
 
-    if opc_needs_sync:
-        actions.append("在 OPC 仓库执行 uv sync 安装 Python 依赖")
+    if not python_deps_ready:
+        actions.append("在当前 skill 目录执行 uv sync 安装 Python 依赖")
 
     return actions
 
 
-def check_environment(source: str, opc_root: str | pathlib.Path = DEFAULT_OPC_ROOT) -> CheckResult:
+def check_environment(source: str) -> CheckResult:
     source_info = classify_source(source)
     platform_info = detect_platform()
-    opc_path = pathlib.Path(opc_root).expanduser().resolve()
-
-    if not opc_path.exists():
-        raise SkillError(f"找不到 OPC 仓库目录: {opc_path}")
 
     missing_tools: list[str] = []
     for tool in ("python3", "uv"):
@@ -303,10 +319,10 @@ def check_environment(source: str, opc_root: str | pathlib.Path = DEFAULT_OPC_RO
     if source_info.kind in REMOTE_VIDEO_KINDS and not _command_exists("yt-dlp"):
         missing_tools.append("yt-dlp")
 
-    needs_sync = _opc_needs_sync(opc_path) if _command_exists("uv") else True
+    python_deps_ready = _python_deps_ready() if _command_exists("python3") else False
     actions = build_install_actions(
         missing_tools=missing_tools,
-        opc_needs_sync=needs_sync,
+        python_deps_ready=python_deps_ready,
         source_kind=source_info.kind,
         platform_name=platform_info.platform_name,
         brew_available=_command_exists("brew"),
@@ -316,8 +332,7 @@ def check_environment(source: str, opc_root: str | pathlib.Path = DEFAULT_OPC_RO
         source=source_info,
         platform=platform_info,
         missing_tools=missing_tools,
-        opc_root=str(opc_path),
-        opc_needs_sync=needs_sync,
+        python_deps_ready=python_deps_ready,
         install_actions=actions,
     )
 
@@ -718,8 +733,8 @@ def install_missing_dependencies(check: CheckResult) -> None:
     if brew_packages:
         _run_command(["brew", "install", *dict.fromkeys(brew_packages)])
 
-    if check.opc_needs_sync:
-        _run_command(["uv", "sync"], cwd=pathlib.Path(check.opc_root))
+    if not check.python_deps_ready:
+        _run_command(["uv", "sync"], cwd=SKILL_ROOT)
 
 
 def _timestamped_run_dir(source: SourceInfo, output_root: pathlib.Path | None) -> pathlib.Path:
@@ -804,10 +819,9 @@ def _prepare_audio_input(
     raise SkillError(f"未知输入类型: {source.kind}")
 
 
-def _run_opc_asr(
+def _run_local_asr(
     audio_path: pathlib.Path,
     *,
-    opc_root: pathlib.Path,
     run_dir: pathlib.Path,
     language: str | None,
     model_size: str,
@@ -822,15 +836,15 @@ def _run_opc_asr(
     isolated_home.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    config_dir = isolated_home / ".opc_cli" / "opc"
+    config_dir = isolated_home / ".video-audio-subtitle"
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "config.json"
     config_payload = {
         "output_dir": str(output_dir),
-        "workspace_dir": str(workspace_dir),
         "model_source": "modelscope",
         "model_cache_dir": str(cache_dir),
         "asr_model_size": model_size,
+        "asr_language": language or "",
     }
     config_path.write_text(
         json.dumps(config_payload, ensure_ascii=False, indent=2),
@@ -838,22 +852,17 @@ def _run_opc_asr(
     )
 
     env = os.environ.copy()
-    env["HOME"] = str(isolated_home)
-    env["OPC_OUTPUT_DIR"] = str(output_dir)
-    env["OPC_WORKSPACE_DIR"] = str(workspace_dir)
+    env["VIDEO_AUDIO_SUBTITLE_CONFIG_DIR"] = str(config_dir)
     env["MODELSCOPE_CACHE"] = str(cache_dir)
     env["HF_HOME"] = str(cache_dir)
-    env["PYTHONUTF8"] = "1"
 
     command = [
-        "uv",
-        "run",
-        "python",
-        "scripts/opc.py",
-        "asr",
+        str(_skill_venv_python(required=True)),
+        str(SCRIPT_ROOT / "media_subtitle.py"),
+        "internal-asr",
         str(audio_path),
-        "--format",
-        "srt",
+        "--output-dir",
+        str(output_dir),
         "--model-size",
         model_size,
         "--max-chars",
@@ -861,8 +870,7 @@ def _run_opc_asr(
     ]
     if language:
         command.extend(["--language", language])
-
-    _run_command(command, cwd=opc_root, env=env)
+    _run_command(command, cwd=SKILL_ROOT, env=env)
 
     stem = audio_path.stem
     candidates = {
@@ -874,7 +882,7 @@ def _run_opc_asr(
 
     missing_outputs = [name for name, path in candidates.items() if not path.exists()]
     if missing_outputs:
-        raise SkillError(f"OPC 执行完成但缺少输出文件: {', '.join(missing_outputs)}")
+        raise SkillError(f"ASR 执行完成但缺少输出文件: {', '.join(missing_outputs)}")
 
     srt_entries = parse_srt(candidates["srt"].read_text(encoding="utf-8"))
     stats = analyze_srt_timing(srt_entries)
@@ -883,8 +891,6 @@ def _run_opc_asr(
         line_entries = json.loads(candidates["lines_json"].read_text(encoding="utf-8"))
         rebuilt_entries = build_srt_entries_from_line_entries(line_entries)
         assert_srt_timing_healthy(rebuilt_entries)
-        # 将修复后的字幕写入 source.fixed.srt，并让 outputs["srt"] 指向该修复版，
-        # 原始 OPC 输出保留在 source.srt 中供参考。
         fixed_srt_path = output_dir / f"{stem}.fixed.srt"
         fixed_srt_path.write_text(write_srt(rebuilt_entries), encoding="utf-8")
         candidates["srt"] = fixed_srt_path
@@ -895,7 +901,6 @@ def _run_opc_asr(
 def execute_pipeline(
     source: str,
     *,
-    opc_root: str | pathlib.Path = DEFAULT_OPC_ROOT,
     output_root: str | pathlib.Path | None = None,
     language: str | None = None,
     model_size: str = "0.6B",
@@ -905,7 +910,7 @@ def execute_pipeline(
     yt_dlp_cookies_file: str | None = None,
     yt_dlp_cookies_from_browser: str | None = None,
 ) -> dict[str, object]:
-    check = check_environment(source, opc_root=opc_root)
+    check = check_environment(source)
     if not check.platform.supported:
         raise UnsupportedPlatformError(check.platform.message)
 
@@ -915,7 +920,7 @@ def execute_pipeline(
         else:
             max_chars = 14
 
-    if check.missing_tools or check.opc_needs_sync:
+    if check.missing_tools or not check.python_deps_ready:
         if not install_missing:
             action_text = "\n".join(f"- {action}" for action in check.install_actions) or "- 无自动安装动作"
             raise MissingDependencyError(
@@ -923,8 +928,8 @@ def execute_pipeline(
                 f"{action_text}"
             )
         install_missing_dependencies(check)
-        check = check_environment(source, opc_root=opc_root)
-        if check.missing_tools or check.opc_needs_sync:
+        check = check_environment(source)
+        if check.missing_tools or not check.python_deps_ready:
             raise MissingDependencyError("依赖安装后仍未就绪，停止执行。")
 
     run_dir = _timestamped_run_dir(
@@ -938,9 +943,8 @@ def execute_pipeline(
         yt_dlp_cookies_from_browser=yt_dlp_cookies_from_browser,
         keep_video=keep_video,
     )
-    outputs = _run_opc_asr(
+    outputs = _run_local_asr(
         prepared_media.audio_path,
-        opc_root=pathlib.Path(check.opc_root),
         run_dir=run_dir,
         language=language,
         model_size=model_size,
@@ -980,7 +984,7 @@ def execute_burn(
     missing_tools = [tool for tool in ("ffmpeg",) if not _command_exists(tool)]
     install_actions = build_install_actions(
         missing_tools=missing_tools,
-        opc_needs_sync=False,
+        python_deps_ready=True,
         source_kind=video_info.kind,
         platform_name=platform_info.platform_name,
         brew_available=_command_exists("brew"),
@@ -997,8 +1001,7 @@ def execute_burn(
                 source=video_info,
                 platform=platform_info,
                 missing_tools=missing_tools,
-                opc_root=str(DEFAULT_OPC_ROOT),
-                opc_needs_sync=False,
+                python_deps_ready=True,
                 install_actions=install_actions,
             )
         )
@@ -1076,14 +1079,44 @@ def execute_translate(
     return result
 
 
+def split_lines_json(
+    lines_json: str,
+    *,
+    line: int,
+    after: str,
+    output: str | None = None,
+) -> dict[str, object]:
+    lines_path = pathlib.Path(lines_json).expanduser().resolve()
+    if not lines_path.exists():
+        raise FileNotFoundError(f"找不到 lines.json 文件: {lines_path}")
+    if lines_path.suffix.lower() != ".json":
+        raise SkillError(f"split 只接受 lines.json 文件，当前输入不是 json: {lines_path}")
+    if not after:
+        raise SkillError("`--after` 不能为空，必须明确提供拆分位置。")
+
+    lines = _load_lines(str(lines_path))
+    updated_lines = split_line_after(lines, line, after)
+
+    output_path = pathlib.Path(output).expanduser().resolve() if output else lines_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_lines(updated_lines, str(output_path))
+
+    return {
+        "input_lines_json": str(lines_path),
+        "output_lines_json": str(output_path),
+        "line": line,
+        "after": after,
+    }
+
+
 def _check_command(args: argparse.Namespace) -> int:
-    result = check_environment(args.source, opc_root=args.opc_root)
+    result = check_environment(args.source)
     print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
     return 0
 
 
 def _install_command(args: argparse.Namespace) -> int:
-    result = check_environment(args.source, opc_root=args.opc_root)
+    result = check_environment(args.source)
     install_missing_dependencies(result)
     print("依赖安装完成。")
     return 0
@@ -1092,7 +1125,6 @@ def _install_command(args: argparse.Namespace) -> int:
 def _run_command_entry(args: argparse.Namespace) -> int:
     result = execute_pipeline(
         args.source,
-        opc_root=args.opc_root,
         output_root=args.output_root,
         language=args.language,
         model_size=args.model_size,
@@ -1129,23 +1161,46 @@ def _translate_command_entry(args: argparse.Namespace) -> int:
     return 0
 
 
+def _split_command_entry(args: argparse.Namespace) -> int:
+    result = split_lines_json(
+        args.lines_json,
+        line=args.line,
+        after=args.after,
+        output=args.output,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _internal_asr_command_entry(args: argparse.Namespace) -> int:
+    run_pipeline(
+        args.audio,
+        output_dir=args.output_dir,
+        fmt="all",
+        ass_style="default",
+        fix_dir=None,
+        language=args.language,
+        model_size=args.model_size,
+        max_chars=args.max_chars,
+        resume_from=None,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="视频/音频转字幕 skill 入口")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check_parser = subparsers.add_parser("check", help="检查输入与依赖")
     check_parser.add_argument("source", help="本地音频/视频路径或 YouTube 链接")
-    check_parser.add_argument("--opc-root", default=str(DEFAULT_OPC_ROOT))
     check_parser.set_defaults(func=_check_command)
 
     install_parser = subparsers.add_parser("install", help="安装缺失依赖")
     install_parser.add_argument("source", help="本地音频/视频路径或 YouTube 链接")
-    install_parser.add_argument("--opc-root", default=str(DEFAULT_OPC_ROOT))
     install_parser.set_defaults(func=_install_command)
 
     run_parser = subparsers.add_parser("run", help="执行完整字幕流程")
     run_parser.add_argument("source", help="本地音频/视频路径或 YouTube 链接")
-    run_parser.add_argument("--opc-root", default=str(DEFAULT_OPC_ROOT))
     run_parser.add_argument("--output-root", default=None)
     run_parser.add_argument("--language", default=None)
     run_parser.add_argument("--model-size", choices=["0.6B", "1.7B"], default="0.6B")
@@ -1182,6 +1237,21 @@ def build_parser() -> argparse.ArgumentParser:
     translate_parser.add_argument("--source-language", default="auto")
     translate_parser.add_argument("--output", default=None)
     translate_parser.set_defaults(func=_translate_command_entry)
+
+    split_parser = subparsers.add_parser("split", help="手工拆分 lines.json 中的某一条字幕")
+    split_parser.add_argument("lines_json", help="由 run 生成的 <name>.lines.json")
+    split_parser.add_argument("--line", type=int, required=True, help="要拆分的字幕行号，从 1 开始")
+    split_parser.add_argument("--after", required=True, help="在该文本之后拆开，必须与原行中的片段完全匹配")
+    split_parser.add_argument("--output", default=None, help="可选输出 json 路径；默认覆盖原文件")
+    split_parser.set_defaults(func=_split_command_entry)
+
+    internal_asr_parser = subparsers.add_parser("internal-asr", help=argparse.SUPPRESS)
+    internal_asr_parser.add_argument("audio")
+    internal_asr_parser.add_argument("--output-dir", required=True)
+    internal_asr_parser.add_argument("--language", default=None)
+    internal_asr_parser.add_argument("--model-size", choices=["0.6B", "1.7B"], default="0.6B")
+    internal_asr_parser.add_argument("--max-chars", type=validate_max_chars, required=True)
+    internal_asr_parser.set_defaults(func=_internal_asr_command_entry)
 
     return parser
 

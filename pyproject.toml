@@ -1,0 +1,14 @@
+[project]
+name = "video-audio-subtitle"
+version = "0.1.0"
+description = "Standalone video/audio subtitle skill with Qwen3 ASR pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "soundfile>=0.12.1",
+  "modelscope>=1.23.2",
+  "huggingface_hub>=0.34.4",
+  "mlx-audio[stt]>=0.4.0; sys_platform == 'darwin'",
+]
+
+[tool.uv]
+package = false

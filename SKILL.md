@@ -1,17 +1,17 @@
 ---
 name: video-audio-subtitle
-description: 用于把本地视频、本地音频或 YouTube 链接转换成带时间对齐的字幕文件。当前只正式支持 macOS Apple Silicon；调用时必须先检查依赖，若缺少 ffmpeg、yt-dlp 或 OPC Python 依赖，先明确告知并在用户同意后再安装，然后再执行字幕流程。
+description: 用于把本地视频、本地音频或 YouTube 链接转换成带时间对齐的字幕文件。当前只正式支持 macOS Apple Silicon；调用时必须先检查依赖，若缺少 ffmpeg、yt-dlp 或当前 skill 自身的 Python 依赖，先明确告知并在用户同意后再安装，然后再执行字幕流程。
 ---
 
 # Video Audio Subtitle
 
 这个 skill 用来做一条明确链路：
 
-- 本地视频 -> 抽音频 -> OPC ASR 对齐 -> 生成 `srt/ass`
-- 本地音频 -> OPC ASR 对齐 -> 生成 `srt/ass`
-- YouTube 链接 -> 下载音频 -> OPC ASR 对齐 -> 生成 `srt/ass`
-- Bilibili 链接 -> 下载音频 -> OPC ASR 对齐 -> 生成 `srt/ass`
-- TikTok / Douyin 链接 -> 下载音频 -> OPC ASR 对齐 -> 生成 `srt/ass`
+- 本地视频 -> 抽音频 -> 本地 ASR 对齐 -> 生成 `srt/ass`
+- 本地音频 -> 本地 ASR 对齐 -> 生成 `srt/ass`
+- YouTube 链接 -> 下载音频 -> 本地 ASR 对齐 -> 生成 `srt/ass`
+- Bilibili 链接 -> 下载音频 -> 本地 ASR 对齐 -> 生成 `srt/ass`
+- TikTok / Douyin 链接 -> 下载音频 -> 本地 ASR 对齐 -> 生成 `srt/ass`
 - 本地视频 + 本地 `srt/ass` -> 烧录字幕 -> 输出带字幕 `mp4`
 
 当前约束：
@@ -61,8 +61,8 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
 - `uv` 是否存在
 - 视频 / YouTube 输入是否需要 `ffmpeg`、`ffprobe`
 - YouTube 输入是否需要 `yt-dlp`
-- `/Users/mac/Documents/github资源/OPC/opc-cli` 是否存在
-- OPC 仓库是否需要执行 `uv sync`
+- 当前 skill 的 `.venv/bin/python` 是否存在
+- 当前 skill 是否需要执行 `uv sync`
 
 对于 `ffmpeg` / `ffprobe`：
 
@@ -70,7 +70,7 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
 - 查不到时才回退到系统 `PATH` 里的普通 `ffmpeg`
 - 安装缺失依赖时，默认安装的是 `ffmpeg-full`，不是普通 `ffmpeg`
 
-如果输出里 `missing_tools` 非空，或者 `opc_needs_sync=true`，不要直接安装，先把将执行的安装动作告诉用户。
+如果输出里 `missing_tools` 非空，或者 `python_deps_ready=false`，不要直接安装，先把将执行的安装动作告诉用户。
 
 ### 2. 只有在用户同意后，才安装
 
@@ -83,7 +83,7 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
 当前安装策略：
 
 - `macOS` 通过 `brew install ...` 安装系统工具
-- OPC Python 依赖通过 `cd /Users/mac/Documents/github资源/OPC/opc-cli && uv sync` 安装
+- 当前 skill 的 Python 依赖通过 `cd /Users/mac/Documents/skills/video-audio-subtitle && uv sync` 安装
 
 其中媒体工具默认策略是：
 
@@ -153,6 +153,20 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
 - skill 会优先用 `ffmpeg-full` 做烧录
 - 如果最终解析到的 `ffmpeg` 没有 `subtitles` 或 `ass` 滤镜，会直接报阻塞，不做隐式替代
 
+### 5. 需要手工拆分超长字幕时，使用 split
+
+```bash
+python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.py split "<lines.json>" --line 3 --after "Hello "
+```
+
+约束：
+
+- `split` 只接受 `run` 产出的 `lines.json`
+- `--line` 从 `1` 开始计数
+- `--after` 必须与原字幕行中的文本片段完全匹配
+- 默认直接覆盖原 `lines.json`
+- 如果要保留原文件，显式传 `--output /absolute/path/to/new.lines.json`
+
 ## 输出内容
 
 每次运行会产出：
@@ -171,7 +185,7 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
 - 模型缓存会落在 `video-audio-subtitle/cache/models/`，不会每次重新下载
 - `burn` 模式会额外产出 `output/<video>.subtitled.mp4`，或写到 `--output` 指定位置
 
-如果 `opc-cli` 导出的 `srt` 出现大量零时长字幕：
+如果导出的 `srt` 出现大量零时长字幕：
 
 - skill 会把它视为时间轴异常
 - 不再继续默默使用坏掉的 `srt`
@@ -219,10 +233,11 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
 
 ## 明确问题点
 
-- `opc-cli` 对外公开接口是 `audio -> subtitles`，不是完整封装好的 `video -> subtitles`
-- 本 skill 显式补上了视频抽音频与 YouTube 下载这两层
+- 本 skill 是独立的本地 ASR/字幕工具，不再依赖外部 `opc-cli` 目录
+- 本 skill 自己补上了视频抽音频与 YouTube 下载这两层
 - 本 skill 默认安装并优先使用 `ffmpeg-full`
 - 本 skill 新增了 `burn`，但它是否可用仍取决于最终解析到的 `ffmpeg` 是否带字幕滤镜
+- 本 skill 新增了 `split`，用于手工修正超长字幕行；它不会偷偷修改原句意，只按你指定的位置拆分
 - `Windows` 没有被伪装成已支持
 - 依赖缺失不会自动处理，必须先拿到用户同意
 - YouTube 下载可能被源站要求登录或 cookies，这不是本 skill 的本地 ASR 能力问题
