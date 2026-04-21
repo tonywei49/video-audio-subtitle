@@ -568,7 +568,7 @@ class StandaloneAsrEngineTests(unittest.TestCase):
         self.assertEqual(words[0].start_time, 0.0)
         self.assertEqual(words[-1].end_time, 4.0)
 
-    def test_mlx_long_audio_path_aligns_segments_without_second_asr(self) -> None:
+    def test_mlx_long_audio_path_uses_segments_without_aligner(self) -> None:
         class FakeResult:
             def __init__(self) -> None:
                 self.text = "Hello world. Second line."
@@ -585,34 +585,9 @@ class StandaloneAsrEngineTests(unittest.TestCase):
                 self.calls.append((audio, kwargs))
                 return FakeResult()
 
-        class FakeAlignItem:
-            def __init__(self, text: str, start_time: float, end_time: float) -> None:
-                self.text = text
-                self.start_time = start_time
-                self.end_time = end_time
-
-        class FakeAlignerModel:
-            def __init__(self) -> None:
-                self.calls = []
-
-            def generate(self, audio, text, language=None):
-                self.calls.append((audio, text, language))
-                if text.startswith("Hello"):
-                    return [
-                        FakeAlignItem("Hello", 0.0, 0.8),
-                        FakeAlignItem("world", 0.8, 1.8),
-                    ]
-                return [
-                    FakeAlignItem("Second", 0.0, 0.7),
-                    FakeAlignItem("line", 0.7, 1.5),
-                ]
-
-        fake_asr = FakeAsrModel()
-        fake_aligner = FakeAlignerModel()
-
         with mock.patch("scripts.asr.engine.get_backend", return_value="mlx"), mock.patch(
             "scripts.asr.engine.get_asr_model",
-            return_value={"asr": fake_asr, "aligner": fake_aligner},
+            return_value={"asr": FakeAsrModel()},
         ) as get_model_mock, mock.patch(
             "scripts.asr.engine.load_audio",
             return_value=([0.0] * int(301 * 16000), 16000),
@@ -621,10 +596,7 @@ class StandaloneAsrEngineTests(unittest.TestCase):
 
         self.assertTrue(result.words)
         self.assertEqual(result.text, "Hello world. Second line.")
-        self.assertEqual(len(fake_asr.calls), 1)
-        self.assertEqual(len(fake_aligner.calls), 2)
-        self.assertEqual("".join(word.text for word in result.words), "Hello world. Second line.")
-        get_model_mock.assert_called_once_with("mlx-community/Qwen3-ASR-0.6B-8bit", with_aligner=True)
+        get_model_mock.assert_called_once_with("mlx-community/Qwen3-ASR-0.6B-8bit", with_aligner=False)
 
 
 class ParserTests(unittest.TestCase):

@@ -162,13 +162,10 @@ def asr_align(audio_path: str, language: str | None = None, model_size: str = "1
     print(f"Audio duration: {duration:.2f}s", flush=True)
 
     if backend == "mlx" and duration > _LONG_AUDIO_DURATION:
-        models_dict = get_asr_model(model_id, with_aligner=True)
-        return _asr_align_mlx_segment_aligned(
+        models_dict = get_asr_model(model_id, with_aligner=False)
+        return _asr_align_mlx_segmented(
             models_dict["asr"],
-            models_dict["aligner"],
             audio_path,
-            wav,
-            sr,
             duration,
             language,
         )
@@ -288,25 +285,16 @@ def _asr_align_mlx(asr_model, aligner_model, audio_path: str, wav, sr: int, dura
     return ASRResult(language=detected_language, text=merged_text, duration=duration, words=all_words)
 
 
-def _asr_align_mlx_segment_aligned(
-    asr_model,
-    aligner_model,
-    audio_path: str,
-    wav,
-    sr: int,
-    duration: float,
-    language: str | None,
-) -> ASRResult:
+def _asr_align_mlx_segmented(asr_model, audio_path: str, duration: float, language: str | None) -> ASRResult:
     detected_language = _language_to_code(language) or "chinese"
     print(
-        "MLX 长音频改走 segment 级对齐模式："
-        "保留一次完整 ASR，"
-        "再直接对每个 ASR segment 做 ForcedAligner，"
-        "不再执行每个 30 秒块的二次 ASR。",
+        "MLX 长音频改走 segment 时间线模式："
+        "不再执行每个 30 秒块的二次 ASR + ForcedAligner，"
+        "改为直接使用 ASR 的 segment 时间并在段内按文本比例分配时间。",
         flush=True,
     )
     print(
-        f"Step 1/2: Transcribing with chunk_duration={_MLX_SEGMENT_CHUNK_DURATION:.0f}s ...",
+        f"Step 1/1: Transcribing with chunk_duration={_MLX_SEGMENT_CHUNK_DURATION:.0f}s ...",
         flush=True,
     )
     asr_result = asr_model.generate(
@@ -321,49 +309,9 @@ def _asr_align_mlx_segment_aligned(
         raise RuntimeError("MLX 长音频 segment 模式没有返回可用 segments，无法继续生成字幕。")
 
     print(f"Segments: {len(segments)}", flush=True)
-    print("Step 2/2: Aligning ASR segments ...", flush=True)
-    all_words: list[WordTimestamp] = []
-    valid_segments = [
-        segment
-        for segment in segments
-        if str(segment.get("text", "") or "").strip()
-        and float(segment.get("end", segment.get("start", 0.0)) or 0.0)
-        > float(segment.get("start", 0.0) or 0.0)
-    ]
-
-    for idx, segment in enumerate(valid_segments, start=1):
-        text = str(segment.get("text", "") or "")
-        start = float(segment.get("start", 0.0) or 0.0)
-        end = float(segment.get("end", start) or start)
-        start_sample = max(0, min(len(wav), int(start * sr)))
-        end_sample = max(start_sample, min(len(wav), int(end * sr)))
-        if end_sample <= start_sample:
-            raise RuntimeError(f"Segment {idx}/{len(valid_segments)} 音频切片为空，无法对齐。")
-
-        print(
-            f"  Align segment {idx}/{len(valid_segments)} "
-            f"(offset={start:.2f}s, dur={end - start:.2f}s, chars={len(text)})",
-            flush=True,
-        )
-        align_result = aligner_model.generate(
-            audio=wav[start_sample:end_sample],
-            text=text,
-            language=detected_language,
-        )
-        chunk_words = [
-            WordTimestamp(
-                text=item.text,
-                start_time=item.start_time + start,
-                end_time=item.end_time + start,
-            )
-            for item in align_result
-        ]
-        if not chunk_words:
-            raise RuntimeError(f"Segment {idx}/{len(valid_segments)} 对齐后没有返回任何词级时间。")
-        all_words.extend(_restore_punctuation(chunk_words, text))
-
+    all_words = _segments_to_word_timestamps(segments)
     if not all_words:
-        raise RuntimeError("MLX 长音频 segment 级对齐后未能生成任何可用时间片。")
+        raise RuntimeError("MLX 长音频 segment 模式未能生成任何可用时间片。")
 
     return ASRResult(
         language=detected_language,
