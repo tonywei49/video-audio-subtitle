@@ -21,7 +21,7 @@ SKILL_ROOT = SCRIPT_ROOT.parent
 if str(SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(SKILL_ROOT))
 
-from scripts.asr.pipeline import _load_lines, _save_lines, run_pipeline, split_line_after
+from scripts.asr.pipeline import PipelineQualityError, _load_lines, _save_lines, run_pipeline, split_line_after
 from scripts.shared.model_path import get_model_source
 from scripts.shared.platform import check_dependency_available, get_backend
 
@@ -110,6 +110,12 @@ class SubtitleInfo:
 class PreparedMedia:
     audio_path: pathlib.Path
     video_path: pathlib.Path | None = None
+
+
+@dataclass(frozen=True)
+class AudioPreprocessOptions:
+    normalize_audio: bool = False
+    trim_silence: bool = False
 
 
 def _parse_srt_timestamp(timestamp: str) -> int:
@@ -372,6 +378,57 @@ def build_ytdlp_command(
         command.extend(["--cookies-from-browser", cookies_from_browser])
     command.append(source_url)
     return command
+
+
+def build_audio_preprocess_command(
+    *,
+    ffmpeg_bin: str,
+    input_path: str,
+    output_path: str,
+    source_is_video: bool,
+    options: AudioPreprocessOptions,
+) -> list[str]:
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        input_path,
+    ]
+    if source_is_video:
+        command.append("-vn")
+
+    audio_filters: list[str] = []
+    if options.trim_silence:
+        audio_filters.append(
+            "silenceremove="
+            "start_periods=1:start_duration=0.3:start_threshold=-45dB:"
+            "stop_periods=1:stop_duration=0.3:stop_threshold=-45dB"
+        )
+    if options.normalize_audio:
+        audio_filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    if audio_filters:
+        command.extend(["-af", ",".join(audio_filters)])
+
+    command.extend(
+        [
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            output_path,
+        ]
+    )
+    return command
+
+
+def validate_audio_preprocess_options(options: AudioPreprocessOptions) -> None:
+    if options.trim_silence:
+        raise SkillError(
+            "`--trim-silence` 当前未安全支持：它会改变字幕时间基准，"
+            "而现有实现已在真实样本上出现过度裁切。为保证稳定性，当前版本直接阻断，不做隐式回退。"
+        )
 
 
 def parse_srt(content: str) -> list[dict[str, object]]:
@@ -753,31 +810,35 @@ def _prepare_audio_input(
     yt_dlp_cookies_file: str | None,
     yt_dlp_cookies_from_browser: str | None,
     keep_video: bool,
+    audio_preprocess: AudioPreprocessOptions,
 ) -> PreparedMedia:
     work_dir = run_dir / "work"
     work_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg_bin = resolve_tool_path("ffmpeg")
 
     if source.kind == "audio_file":
-        return PreparedMedia(audio_path=pathlib.Path(source.resolved_path))
+        output_audio = work_dir / "source.wav"
+        _run_command(
+            build_audio_preprocess_command(
+                ffmpeg_bin=ffmpeg_bin,
+                input_path=str(source.resolved_path),
+                output_path=str(output_audio),
+                source_is_video=False,
+                options=audio_preprocess,
+            )
+        )
+        return PreparedMedia(audio_path=output_audio)
 
     if source.kind == "video_file":
         output_audio = work_dir / "source.wav"
-        ffmpeg_bin = resolve_tool_path("ffmpeg")
         _run_command(
-            [
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                str(source.resolved_path),
-                "-vn",
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                str(output_audio),
-            ]
+            build_audio_preprocess_command(
+                ffmpeg_bin=ffmpeg_bin,
+                input_path=str(source.resolved_path),
+                output_path=str(output_audio),
+                source_is_video=True,
+                options=audio_preprocess,
+            )
         )
         return PreparedMedia(
             audio_path=output_audio,
@@ -785,19 +846,29 @@ def _prepare_audio_input(
         )
 
     if source.kind in REMOTE_VIDEO_KINDS:
-        output_audio_template = work_dir / "source.%(ext)s"
+        downloaded_audio_template = work_dir / "source-download.%(ext)s"
         _run_command(
             build_ytdlp_command(
                 source_url=source.original,
-                output_template=str(output_audio_template),
+                output_template=str(downloaded_audio_template),
                 cookies_file=yt_dlp_cookies_file,
                 cookies_from_browser=yt_dlp_cookies_from_browser,
                 extract_audio=True,
             )
         )
+        downloaded_audio = work_dir / "source-download.wav"
         output_audio = work_dir / "source.wav"
-        if not output_audio.exists():
-            raise SkillError("yt-dlp 执行后未产出 source.wav，无法继续 ASR。")
+        if not downloaded_audio.exists():
+            raise SkillError("yt-dlp 执行后未产出 source-download.wav，无法继续 ASR。")
+        _run_command(
+            build_audio_preprocess_command(
+                ffmpeg_bin=ffmpeg_bin,
+                input_path=str(downloaded_audio),
+                output_path=str(output_audio),
+                source_is_video=False,
+                options=audio_preprocess,
+            )
+        )
         video_path: pathlib.Path | None = None
         if keep_video:
             output_video_template = work_dir / "source-video.%(ext)s"
@@ -826,6 +897,7 @@ def _run_local_asr(
     language: str | None,
     model_size: str,
     max_chars: int,
+    timing_mode: str,
 ) -> dict[str, str]:
     output_dir = run_dir / "output"
     workspace_dir = run_dir / "workspace"
@@ -867,6 +939,8 @@ def _run_local_asr(
         model_size,
         "--max-chars",
         str(max_chars),
+        "--timing-mode",
+        timing_mode,
     ]
     if language:
         command.extend(["--language", language])
@@ -878,6 +952,7 @@ def _run_local_asr(
         "ass": output_dir / f"{stem}.ass",
         "raw_json": output_dir / f"{stem}.raw.json",
         "lines_json": output_dir / f"{stem}.lines.json",
+        "quality_json": output_dir / f"{stem}.quality.json",
     }
 
     missing_outputs = [name for name, path in candidates.items() if not path.exists()]
@@ -895,7 +970,11 @@ def _run_local_asr(
         fixed_srt_path.write_text(write_srt(rebuilt_entries), encoding="utf-8")
         candidates["srt"] = fixed_srt_path
 
-    return {name: str(path) for name, path in candidates.items()}
+    quality_summary = json.loads(candidates["quality_json"].read_text(encoding="utf-8"))
+    return {
+        "paths": {name: str(path) for name, path in candidates.items()},
+        "quality_summary": quality_summary,
+    }
 
 
 def execute_pipeline(
@@ -906,6 +985,9 @@ def execute_pipeline(
     model_size: str = "0.6B",
     max_chars: int | None = None,
     keep_video: bool = False,
+    timing_mode: str = "stable",
+    normalize_audio: bool = False,
+    trim_silence: bool = False,
     install_missing: bool = False,
     yt_dlp_cookies_file: str | None = None,
     yt_dlp_cookies_from_browser: str | None = None,
@@ -936,12 +1018,18 @@ def execute_pipeline(
         check.source,
         pathlib.Path(output_root).expanduser().resolve() if output_root else None,
     )
+    audio_preprocess = AudioPreprocessOptions(
+        normalize_audio=normalize_audio,
+        trim_silence=trim_silence,
+    )
+    validate_audio_preprocess_options(audio_preprocess)
     prepared_media = _prepare_audio_input(
         check.source,
         run_dir,
         yt_dlp_cookies_file=yt_dlp_cookies_file,
         yt_dlp_cookies_from_browser=yt_dlp_cookies_from_browser,
         keep_video=keep_video,
+        audio_preprocess=audio_preprocess,
     )
     outputs = _run_local_asr(
         prepared_media.audio_path,
@@ -949,6 +1037,7 @@ def execute_pipeline(
         language=language,
         model_size=model_size,
         max_chars=validate_max_chars(max_chars),
+        timing_mode=timing_mode,
     )
 
     result = {
@@ -957,7 +1046,10 @@ def execute_pipeline(
         "prepared_video": str(prepared_media.video_path) if prepared_media.video_path else None,
         "run_dir": str(run_dir),
         "max_chars": max_chars,
-        "outputs": outputs,
+        "timing_mode": timing_mode,
+        "audio_preprocess": asdict(audio_preprocess),
+        "outputs": outputs["paths"],
+        "quality_summary": outputs["quality_summary"],
     }
     manifest = run_dir / "result.json"
     manifest.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1130,6 +1222,9 @@ def _run_command_entry(args: argparse.Namespace) -> int:
         model_size=args.model_size,
         max_chars=args.max_chars,
         keep_video=args.keep_video,
+        timing_mode=args.timing_mode,
+        normalize_audio=args.normalize_audio,
+        trim_silence=args.trim_silence,
         install_missing=args.install_missing,
         yt_dlp_cookies_file=args.yt_dlp_cookies,
         yt_dlp_cookies_from_browser=args.yt_dlp_cookies_from_browser,
@@ -1173,17 +1268,21 @@ def _split_command_entry(args: argparse.Namespace) -> int:
 
 
 def _internal_asr_command_entry(args: argparse.Namespace) -> int:
-    run_pipeline(
-        args.audio,
-        output_dir=args.output_dir,
-        fmt="all",
-        ass_style="default",
-        fix_dir=None,
-        language=args.language,
-        model_size=args.model_size,
-        max_chars=args.max_chars,
-        resume_from=None,
-    )
+    try:
+        run_pipeline(
+            args.audio,
+            output_dir=args.output_dir,
+            fmt="all",
+            ass_style="default",
+            fix_dir=None,
+            language=args.language,
+            model_size=args.model_size,
+            max_chars=args.max_chars,
+            timing_mode=args.timing_mode,
+            resume_from=None,
+        )
+    except PipelineQualityError as exc:
+        raise SkillError(str(exc)) from exc
     return 0
 
 
@@ -1204,11 +1303,27 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output-root", default=None)
     run_parser.add_argument("--language", default=None)
     run_parser.add_argument("--model-size", choices=["0.6B", "1.7B"], default="0.6B")
+    run_parser.add_argument(
+        "--timing-mode",
+        choices=["stable", "experimental_segment_align"],
+        default="stable",
+        help="时间轴模式。默认 stable；experimental_segment_align 只用于显式实验。",
+    )
     run_parser.add_argument("--max-chars", type=validate_max_chars, default=None, help="如果为 None 则按语种自动推断 (默认中日文14，纯英文38)")
     run_parser.add_argument(
         "--keep-video",
         action="store_true",
         help="远程视频源时额外保留下载后的视频文件，便于后续烧录字幕。",
+    )
+    run_parser.add_argument(
+        "--normalize-audio",
+        action="store_true",
+        help="显式启用轻音量归一化（loudnorm）；默认只做格式规范化，不做增强。",
+    )
+    run_parser.add_argument(
+        "--trim-silence",
+        action="store_true",
+        help="显式裁掉首尾静音；会改变输入音频边界，默认关闭。",
     )
     run_parser.add_argument("--yt-dlp-cookies", default=None)
     run_parser.add_argument("--yt-dlp-cookies-from-browser", default=None)
@@ -1251,6 +1366,11 @@ def build_parser() -> argparse.ArgumentParser:
     internal_asr_parser.add_argument("--language", default=None)
     internal_asr_parser.add_argument("--model-size", choices=["0.6B", "1.7B"], default="0.6B")
     internal_asr_parser.add_argument("--max-chars", type=validate_max_chars, required=True)
+    internal_asr_parser.add_argument(
+        "--timing-mode",
+        choices=["stable", "experimental_segment_align"],
+        default="stable",
+    )
     internal_asr_parser.set_defaults(func=_internal_asr_command_entry)
 
     return parser

@@ -131,6 +131,16 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
   - 纯英文：`38`
   - 其他语言：`14`
 - `--max-chars` 当前允许 `1-80`
+- 默认会先把输入规范化成 `16kHz / mono / wav`
+- `--normalize-audio` 会显式启用轻音量归一化
+- `--trim-silence` 当前保留为显式参数，但会直接阻断：
+  - 原因是它会改变字幕时间基准
+  - 现有实现已在真实样本上出现过度裁切
+  - 当前版本不会偷偷执行，也不会隐式回退
+- `--timing-mode` 默认是 `stable`
+- `--timing-mode experimental_segment_align` 只用于显式实验：
+  - 只对高风险 segment 尝试 ForcedAligner
+  - 如果实验质量检查失败，会直接报错停止
 - 输出目录在 `video-audio-subtitle/runs/<timestamp>-<name>/`
 
 ### 4. 需要把字幕烧录回视频时，使用 burn
@@ -177,14 +187,22 @@ python3 /Users/mac/Documents/skills/video-audio-subtitle/scripts/media_subtitle.
 - `output/<name>.ass`
 - `output/<name>.raw.json`
 - `output/<name>.lines.json`
+- `output/<name>.quality.json`
 
 其中：
 
 - `raw.json` 是 ASR + 强制对齐后的中间结果
 - `lines.json` 是断句后的中间结果
+- `quality.json` 是词级时间轴和行级显示健康摘要
 - `srt/ass` 是最终字幕
 - 模型缓存会落在 `video-audio-subtitle/cache/models/`，不会每次重新下载
 - `burn` 模式会额外产出 `output/<video>.subtitled.mp4`，或写到 `--output` 指定位置
+
+如果词级时间轴或行级显示健康检查失败：
+
+- skill 会直接停止，不继续产出“假正常”的最终字幕
+- 失败原因会明确打印出来，例如零时长词比例过高、时间轴倒挂、行显示时长异常
+- `raw.json / lines.json / quality.json` 仍会保留，方便排查具体问题
 
 如果导出的 `srt` 出现大量零时长字幕：
 

@@ -30,6 +30,25 @@ _loaded_models: dict[str, object] = {}
 _PUNCT = set('，。、！？；：""''《》【】（）,.!?;:\'"()[]{}·…—~ ')
 _LONG_AUDIO_DURATION = 300.0
 _MLX_SEGMENT_CHUNK_DURATION = 10.0
+_TIMING_EPSILON = 1e-3
+_MAX_ZERO_DURATION_RATIO = 0.05
+_MIN_ZERO_DURATION_WORDS = 5
+_MAX_COLLAPSED_TIMESTAMP_RATIO = 0.1
+_TIMING_MODES = {"stable", "experimental_segment_align"}
+_EXPERIMENTAL_MIN_SEGMENT_DURATION = 1.2
+_EXPERIMENTAL_MAX_SEGMENT_DURATION = 6.0
+_EXPERIMENTAL_MIN_VISIBLE_CHARS = 12
+_EXPERIMENTAL_MIN_CPS = 8.0
+
+
+def _is_cjk_char(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        (0x4E00 <= cp <= 0x9FFF)
+        or (0x3040 <= cp <= 0x309F)
+        or (0x30A0 <= cp <= 0x30FF)
+        or (0xAC00 <= cp <= 0xD7AF)
+    )
 
 
 def _load_asr_cuda(model_id: str, with_aligner: bool = True):
@@ -150,11 +169,18 @@ def _asr_transcribe_mlx(model, audio_path: str, language: str | None):
     return model.generate(audio_path, language=_language_to_code(language), verbose=True).text
 
 
-def asr_align(audio_path: str, language: str | None = None, model_size: str = "1.7B") -> ASRResult:
+def asr_align(
+    audio_path: str,
+    language: str | None = None,
+    model_size: str = "1.7B",
+    timing_mode: str = "stable",
+) -> ASRResult:
     backend = get_backend()
     models = ASR_MODELS[backend]
     if model_size not in models:
         raise ValueError(f"Unknown model size '{model_size}'. Available: {', '.join(models.keys())}")
+    if timing_mode not in _TIMING_MODES:
+        raise ValueError(f"Unknown timing mode '{timing_mode}'. Available: {', '.join(sorted(_TIMING_MODES))}")
 
     model_id = models[model_size]
     wav, sr = load_audio(audio_path)
@@ -162,6 +188,17 @@ def asr_align(audio_path: str, language: str | None = None, model_size: str = "1
     print(f"Audio duration: {duration:.2f}s", flush=True)
 
     if backend == "mlx" and duration > _LONG_AUDIO_DURATION:
+        if timing_mode == "experimental_segment_align":
+            models_dict = get_asr_model(model_id, with_aligner=True)
+            return _asr_align_mlx_experimental_segment_align(
+                models_dict["asr"],
+                models_dict["aligner"],
+                audio_path,
+                wav,
+                sr,
+                duration,
+                language,
+            )
         models_dict = get_asr_model(model_id, with_aligner=False)
         return _asr_align_mlx_segmented(
             models_dict["asr"],
@@ -321,6 +358,108 @@ def _asr_align_mlx_segmented(asr_model, audio_path: str, duration: float, langua
     )
 
 
+def _segment_visible_char_count(text: str) -> int:
+    return sum(1 for ch in text if not ch.isspace() and ch not in _PUNCT)
+
+
+def _should_refine_segment(segment: dict) -> bool:
+    text = str(segment.get("text", "") or "")
+    start = float(segment.get("start", 0.0) or 0.0)
+    end = float(segment.get("end", start) or start)
+    duration = end - start
+    if duration < _EXPERIMENTAL_MIN_SEGMENT_DURATION or duration > _EXPERIMENTAL_MAX_SEGMENT_DURATION:
+        return False
+    visible_chars = _segment_visible_char_count(text)
+    if visible_chars < _EXPERIMENTAL_MIN_VISIBLE_CHARS:
+        return False
+    cps = visible_chars / duration if duration > 0 else float("inf")
+    return cps >= _EXPERIMENTAL_MIN_CPS
+
+
+def _asr_align_mlx_experimental_segment_align(
+    asr_model,
+    aligner_model,
+    audio_path: str,
+    wav,
+    sr: int,
+    duration: float,
+    language: str | None,
+) -> ASRResult:
+    detected_language = _language_to_code(language) or "chinese"
+    print(
+        "MLX 长音频进入实验模式："
+        "先做单次 ASR，再只对高风险 segment 做 ForcedAligner。",
+        flush=True,
+    )
+    asr_result = asr_model.generate(
+        audio_path,
+        language=detected_language,
+        verbose=True,
+        chunk_duration=_MLX_SEGMENT_CHUNK_DURATION,
+    )
+    full_text = asr_result.text
+    segments = getattr(asr_result, "segments", None) or []
+    if not full_text or not segments:
+        raise RuntimeError("实验模式没有拿到可用 segments，无法继续。")
+
+    all_words: list[WordTimestamp] = []
+    refined_segments = 0
+    for idx, segment in enumerate(segments, start=1):
+        text = str(segment.get("text", "") or "")
+        start = float(segment.get("start", 0.0) or 0.0)
+        end = float(segment.get("end", start) or start)
+        if not text.strip() or end <= start:
+            continue
+
+        if not _should_refine_segment(segment):
+            all_words.extend(_segment_text_to_words(text, start, end))
+            continue
+
+        start_sample = max(0, int(start * sr))
+        end_sample = min(len(wav), int(end * sr))
+        segment_wav = wav[start_sample:end_sample]
+        if len(segment_wav) == 0:
+            raise RuntimeError(f"实验模式无法切出第 {idx} 段音频。")
+
+        try:
+            align_result = aligner_model.generate(audio=segment_wav, text=text, language=detected_language)
+        except Exception as exc:
+            raise RuntimeError(f"实验模式第 {idx} 段 ForcedAligner 执行失败: {exc}") from exc
+        if not align_result:
+            raise RuntimeError(f"实验模式第 {idx} 段 ForcedAligner 没有返回任何词时间戳。")
+
+        local_words = [
+            WordTimestamp(text=item.text, start_time=item.start_time, end_time=item.end_time)
+            for item in align_result
+        ]
+        local_issues = validate_word_timing_summary(summarize_word_timing(local_words, end - start))
+        if local_issues:
+            raise RuntimeError(
+                f"实验模式第 {idx} 段词级时间轴检查失败："
+                + "; ".join(local_issues)
+            )
+
+        offset_words = [
+            WordTimestamp(text=item.text, start_time=item.start_time + start, end_time=item.end_time + start)
+            for item in align_result
+        ]
+        all_words.extend(_restore_punctuation(offset_words, text))
+        refined_segments += 1
+
+    if refined_segments == 0:
+        raise RuntimeError(
+            "实验模式没有选中任何高风险 segment，已停止继续，避免假装执行了精对齐。"
+        )
+
+    print(f"Experimental refined segments: {refined_segments}/{len(segments)}", flush=True)
+    return ASRResult(
+        language=detected_language,
+        text=full_text,
+        duration=duration,
+        words=all_words,
+    )
+
+
 def _segments_to_word_timestamps(segments: list[dict]) -> list[WordTimestamp]:
     all_words: list[WordTimestamp] = []
     for segment in segments:
@@ -369,15 +508,6 @@ def _tokenize_segment_text(text: str) -> list[str]:
     if not stripped:
         return []
 
-    def _is_cjk_char(ch: str) -> bool:
-        cp = ord(ch)
-        return (
-            (0x4E00 <= cp <= 0x9FFF)
-            or (0x3040 <= cp <= 0x309F)
-            or (0x30A0 <= cp <= 0x30FF)
-            or (0xAC00 <= cp <= 0xD7AF)
-        )
-
     tokens: list[str] = []
     latin_buffer = ""
     for ch in text:
@@ -410,12 +540,7 @@ def _token_weight(token: str) -> float:
     weight = 0.0
     for ch in token:
         cp = ord(ch)
-        is_cjk = (
-            (0x4E00 <= cp <= 0x9FFF)
-            or (0x3040 <= cp <= 0x309F)
-            or (0x30A0 <= cp <= 0x30FF)
-            or (0xAC00 <= cp <= 0xD7AF)
-        )
+        is_cjk = _is_cjk_char(ch)
         if is_cjk:
             weight += 1.0
         elif ch not in _PUNCT and not ch.isspace():
@@ -442,6 +567,90 @@ def _language_to_code(language: str | None):
         if name.lower() == lower:
             return name
     return language
+
+
+def summarize_word_timing(words: list[WordTimestamp], duration: float) -> dict[str, float | int]:
+    total_words = len(words)
+    zero_duration_words = 0
+    reversed_words = 0
+    non_monotonic_words = 0
+    collapsed_timestamp_words = 0
+    out_of_bounds_words = 0
+    min_duration = None
+    max_duration = 0.0
+    max_gap = 0.0
+    previous_start = None
+    previous_end = None
+
+    for word in words:
+        start = float(word.start_time)
+        end = float(word.end_time)
+        word_duration = end - start
+        if word_duration <= _TIMING_EPSILON:
+            zero_duration_words += 1
+        if end + _TIMING_EPSILON < start:
+            reversed_words += 1
+        if start < -_TIMING_EPSILON or end > duration + _TIMING_EPSILON:
+            out_of_bounds_words += 1
+        if min_duration is None or word_duration < min_duration:
+            min_duration = word_duration
+        if word_duration > max_duration:
+            max_duration = word_duration
+
+        if previous_start is not None and start + _TIMING_EPSILON < previous_start:
+            non_monotonic_words += 1
+        if previous_start is not None and previous_end is not None:
+            if abs(start - previous_start) <= _TIMING_EPSILON and abs(end - previous_end) <= _TIMING_EPSILON:
+                collapsed_timestamp_words += 1
+            gap = start - previous_end
+            if gap > max_gap:
+                max_gap = gap
+
+        previous_start = start
+        previous_end = end
+
+    zero_duration_ratio = zero_duration_words / total_words if total_words else 0.0
+    collapsed_timestamp_ratio = collapsed_timestamp_words / total_words if total_words else 0.0
+
+    return {
+        "total_words": total_words,
+        "zero_duration_words": zero_duration_words,
+        "zero_duration_ratio": zero_duration_ratio,
+        "reversed_words": reversed_words,
+        "non_monotonic_words": non_monotonic_words,
+        "collapsed_timestamp_words": collapsed_timestamp_words,
+        "collapsed_timestamp_ratio": collapsed_timestamp_ratio,
+        "out_of_bounds_words": out_of_bounds_words,
+        "min_word_duration": min_duration if min_duration is not None else 0.0,
+        "max_word_duration": max_duration,
+        "max_gap": max_gap,
+    }
+
+
+def validate_word_timing_summary(summary: dict[str, float | int]) -> list[str]:
+    issues: list[str] = []
+    if int(summary["reversed_words"]) > 0:
+        issues.append(f"发现 {summary['reversed_words']} 个词出现 end_time < start_time。")
+    if int(summary["non_monotonic_words"]) > 0:
+        issues.append(f"发现 {summary['non_monotonic_words']} 个词的时间轴非单调递增。")
+    if int(summary["out_of_bounds_words"]) > 0:
+        issues.append(f"发现 {summary['out_of_bounds_words']} 个词超出音频总时长边界。")
+    if (
+        int(summary["zero_duration_words"]) >= _MIN_ZERO_DURATION_WORDS
+        and float(summary["zero_duration_ratio"]) > _MAX_ZERO_DURATION_RATIO
+    ):
+        issues.append(
+            "零时长词比例过高："
+            f"{summary['zero_duration_words']}/{summary['total_words']} "
+            f"({float(summary['zero_duration_ratio']) * 100:.1f}%)。"
+        )
+    if float(summary["collapsed_timestamp_ratio"]) > _MAX_COLLAPSED_TIMESTAMP_RATIO:
+        issues.append(
+            "大量词共享同一时间戳："
+            f"{summary['collapsed_timestamp_words']}/{summary['total_words']} "
+            f"({float(summary['collapsed_timestamp_ratio']) * 100:.1f}%)。"
+        )
+    return issues
 
 
 def result_to_dict(result: ASRResult) -> dict:

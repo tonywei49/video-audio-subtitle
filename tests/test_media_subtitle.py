@@ -15,11 +15,16 @@ from scripts.shared import model_path as shared_model_path
 from scripts.shared import platform as shared_platform
 from scripts.asr import engine as standalone_engine
 from scripts.asr.pipeline import (
+    PipelineQualityError,
     SubtitleLine as StandaloneSubtitleLine,
+    _break_paragraph as standalone_break_paragraph,
     _build_paragraphs as standalone_build_paragraphs,
     _smart_split as standalone_smart_split,
+    check_line_timing as standalone_check_line_timing,
+    run_pipeline as standalone_run_pipeline,
     split_line_after as standalone_split_line_after,
     stage_check as standalone_stage_check,
+    summarize_line_timing as standalone_summarize_line_timing,
 )
 from scripts.asr.render import (
     ASSSubtitleStyle as StandaloneASSSubtitleStyle,
@@ -27,7 +32,9 @@ from scripts.asr.render import (
     format_srt_time as standalone_format_srt_time,
 )
 from scripts.media_subtitle import (
+    AudioPreprocessOptions,
     analyze_srt_timing,
+    build_audio_preprocess_command,
     assert_srt_timing_healthy,
     build_srt_entries_from_line_entries,
     build_burn_command,
@@ -45,6 +52,7 @@ from scripts.media_subtitle import (
     seconds_to_srt_timestamp,
     split_lines_json,
     split_translated_chunk,
+    validate_audio_preprocess_options,
     validate_max_chars,
     write_srt,
 )
@@ -217,6 +225,44 @@ class YtDlpCommandTests(unittest.TestCase):
         self.assertNotIn("--audio-format", command)
         self.assertIn("--merge-output-format", command)
         self.assertIn("mp4", command)
+
+
+class AudioPreprocessCommandTests(unittest.TestCase):
+    def test_builds_baseline_audio_normalization_command(self) -> None:
+        command = build_audio_preprocess_command(
+            ffmpeg_bin="/opt/homebrew/bin/ffmpeg",
+            input_path="/tmp/input.mp3",
+            output_path="/tmp/output.wav",
+            source_is_video=False,
+            options=AudioPreprocessOptions(),
+        )
+
+        self.assertEqual(command[:4], ["/opt/homebrew/bin/ffmpeg", "-y", "-i", "/tmp/input.mp3"])
+        self.assertNotIn("-vn", command)
+        self.assertNotIn("-af", command)
+        self.assertEqual(
+            command[-7:],
+            ["-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "/tmp/output.wav"],
+        )
+
+    def test_builds_video_preprocess_command_with_optional_filters(self) -> None:
+        command = build_audio_preprocess_command(
+            ffmpeg_bin="/opt/homebrew/bin/ffmpeg",
+            input_path="/tmp/input.mp4",
+            output_path="/tmp/output.wav",
+            source_is_video=True,
+            options=AudioPreprocessOptions(normalize_audio=True, trim_silence=True),
+        )
+
+        self.assertIn("-vn", command)
+        self.assertIn("-af", command)
+        filter_value = command[command.index("-af") + 1]
+        self.assertIn("silenceremove=", filter_value)
+        self.assertIn("loudnorm=", filter_value)
+
+    def test_validate_audio_preprocess_options_rejects_trim_silence(self) -> None:
+        with self.assertRaisesRegex(Exception, "trim-silence"):
+            validate_audio_preprocess_options(AudioPreprocessOptions(trim_silence=True))
 
 
 class SrtTranslationTests(unittest.TestCase):
@@ -459,10 +505,26 @@ class StandaloneAsrPipelineTests(unittest.TestCase):
                 {"text": "long ", "start_time": 0.9, "end_time": 1.2},
                 {"text": "line", "start_time": 1.2, "end_time": 1.5},
             ],
-            max_chars=3,
+            max_chars=8,
+            profile="english",
         )
 
         self.assertGreaterEqual(len(lines), 2)
+
+    def test_break_paragraph_merges_english_fragments(self) -> None:
+        lines = standalone_break_paragraph(
+            standalone_build_paragraphs(
+                [
+                    {"text": "Well, ", "start_time": 0.0, "end_time": 0.2},
+                    {"text": "this ", "start_time": 0.2, "end_time": 0.6},
+                    {"text": "works.", "start_time": 0.6, "end_time": 1.2},
+                ]
+            )[0],
+            max_chars=38,
+        )
+
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].text, "Well, this works.")
 
     def test_split_line_after_splits_unique_text(self) -> None:
         lines = [
@@ -484,7 +546,7 @@ class StandaloneAsrPipelineTests(unittest.TestCase):
 
     def test_stage_check_reports_long_line(self) -> None:
         errors = standalone_stage_check(
-            [StandaloneSubtitleLine(text="這是一個非常非常長的字幕行", start_time=0.0, end_time=1.0)],
+            [StandaloneSubtitleLine(text="這是一個非常非常長的字幕行", start_time=0.0, end_time=3.0)],
             max_chars=4,
         )
         self.assertEqual(len(errors), 1)
@@ -598,6 +660,96 @@ class StandaloneAsrEngineTests(unittest.TestCase):
         self.assertEqual(result.text, "Hello world. Second line.")
         get_model_mock.assert_called_once_with("mlx-community/Qwen3-ASR-0.6B-8bit", with_aligner=False)
 
+    def test_mlx_long_audio_experimental_mode_uses_aligner(self) -> None:
+        with mock.patch("scripts.asr.engine.get_backend", return_value="mlx"), mock.patch(
+            "scripts.asr.engine.get_asr_model",
+            return_value={"asr": object(), "aligner": object()},
+        ) as get_model_mock, mock.patch(
+            "scripts.asr.engine.load_audio",
+            return_value=([0.0] * int(301 * 16000), 16000),
+        ), mock.patch(
+            "scripts.asr.engine._asr_align_mlx_experimental_segment_align",
+            return_value=standalone_engine.ASRResult(language="English", text="ok", duration=301.0, words=[]),
+        ) as experimental_mock:
+            result = standalone_engine.asr_align(
+                "/tmp/sample.wav",
+                language="English",
+                model_size="0.6B",
+                timing_mode="experimental_segment_align",
+            )
+
+        self.assertEqual(result.text, "ok")
+        get_model_mock.assert_called_once_with("mlx-community/Qwen3-ASR-0.6B-8bit", with_aligner=True)
+        self.assertTrue(experimental_mock.called)
+
+    def test_word_timing_summary_reports_zero_duration_ratio(self) -> None:
+        words = [
+            standalone_engine.WordTimestamp(text=f"w{i}", start_time=1.0, end_time=1.0)
+            for i in range(10)
+        ]
+        summary = standalone_engine.summarize_word_timing(words, duration=10.0)
+        issues = standalone_engine.validate_word_timing_summary(summary)
+        self.assertTrue(any("零时长词比例过高" in issue for issue in issues))
+
+    def test_word_timing_summary_accepts_healthy_words(self) -> None:
+        words = [
+            standalone_engine.WordTimestamp(text="Hello ", start_time=0.0, end_time=0.5),
+            standalone_engine.WordTimestamp(text="world", start_time=0.5, end_time=1.0),
+        ]
+        summary = standalone_engine.summarize_word_timing(words, duration=2.0)
+        issues = standalone_engine.validate_word_timing_summary(summary)
+        self.assertEqual(issues, [])
+
+
+class QualityCheckTests(unittest.TestCase):
+    def test_check_line_timing_reports_short_duration(self) -> None:
+        errors = standalone_check_line_timing(
+            [
+                StandaloneSubtitleLine(
+                    text="你好世界",
+                    start_time=0.0,
+                    end_time=0.2,
+                    words=[{"text": "你好世界", "start_time": 0.0, "end_time": 0.2}],
+                )
+            ]
+        )
+        self.assertTrue(any(error.checker == "line_timing" for error in errors))
+
+    def test_summarize_line_timing_reports_high_cps(self) -> None:
+        summary = standalone_summarize_line_timing(
+            [
+                StandaloneSubtitleLine(
+                    text="这是非常快的一行字幕",
+                    start_time=0.0,
+                    end_time=0.5,
+                    words=[{"text": "这是非常快的一行字幕", "start_time": 0.0, "end_time": 0.5}],
+                )
+            ]
+        )
+        self.assertEqual(summary["high_cps_lines"], 1)
+
+    def test_run_pipeline_raises_on_bad_word_timing(self) -> None:
+        class FakeAsrResult:
+            def __init__(self) -> None:
+                self.language = "English"
+                self.text = "broken"
+                self.duration = 3.0
+                self.words = [
+                    standalone_engine.WordTimestamp(text=f"w{i}", start_time=1.0, end_time=1.0)
+                    for i in range(20)
+                ]
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch(
+            "scripts.asr.pipeline.asr_align",
+            return_value=FakeAsrResult(),
+        ):
+            audio_path = pathlib.Path(tmpdir) / "sample.wav"
+            audio_path.write_bytes(b"fake")
+            output_dir = pathlib.Path(tmpdir) / "out"
+
+            with self.assertRaises(PipelineQualityError):
+                standalone_run_pipeline(str(audio_path), output_dir=str(output_dir), fmt="all", max_chars=14)
+
 
 class ParserTests(unittest.TestCase):
     def test_run_parser_supports_max_chars(self) -> None:
@@ -620,6 +772,21 @@ class ParserTests(unittest.TestCase):
         args = parser.parse_args(["run", "https://www.youtube.com/watch?v=abc", "--keep-video"])
 
         self.assertTrue(args.keep_video)
+
+    def test_run_parser_supports_audio_preprocess_flags(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["run", "input.mp3", "--normalize-audio", "--trim-silence"])
+
+        self.assertTrue(args.normalize_audio)
+        self.assertTrue(args.trim_silence)
+
+    def test_run_parser_supports_timing_mode(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(["run", "input.mp3", "--timing-mode", "experimental_segment_align"])
+
+        self.assertEqual(args.timing_mode, "experimental_segment_align")
 
     def test_burn_parser_accepts_video_and_subtitle(self) -> None:
         parser = build_parser()
