@@ -18,10 +18,13 @@ _LINE_MIN_DURATION = 0.4
 _LINE_MAX_DURATION = 8.0
 _LINE_OVERLAP_TOLERANCE = 0.05
 _FRAGMENT_MERGE_GAP = 0.35
+_ENGLISH_FRAGMENT_MERGE_GAP = 1.5
 _ENGLISH_FRAGMENT_CONTENT = 4.0
 _CJK_FRAGMENT_CONTENT = 2.0
 _ENGLISH_SHORT_LINE_CONTENT = 5.0
 _CJK_SHORT_LINE_CONTENT = 3.0
+_ENGLISH_CPS_THRESHOLD = 23.0
+_CJK_CPS_THRESHOLD = 8.0
 
 
 class PipelineQualityError(RuntimeError):
@@ -94,6 +97,15 @@ def _line_unit_count(text: str, profile: str) -> float:
     return _line_cjk_count(text)
 
 
+def _line_split_count(text: str, profile: str) -> float:
+    # English line breaking used to rely on the weighted legacy counter.
+    # Reusing it here keeps line-length splitting stable while CPS checks
+    # can still use visible characters.
+    if profile == "english":
+        return _line_cjk_count(text)
+    return _line_cjk_count(text)
+
+
 def stage1_asr(
     audio_path: str,
     output_dir: str,
@@ -125,6 +137,7 @@ def stage2_break(result_dict: dict, output_dir: str, audio_path: str, max_chars:
     all_lines: list[SubtitleLine] = []
     for para in paragraphs:
         all_lines.extend(_break_paragraph(para, max_chars))
+    all_lines = _trim_incomplete_trailing_line(all_lines, float(result_dict.get("duration", 0.0) or 0.0))
     for i in range(len(all_lines) - 1):
         gap = all_lines[i + 1].start_time - all_lines[i].end_time
         all_lines[i].pause_after = max(0, gap)
@@ -177,7 +190,7 @@ def _break_paragraph(para: Paragraph, max_chars: int) -> list[SubtitleLine]:
 
     lines = []
     for seg_words in segments:
-        seg_len = sum(_line_unit_count(w.get("text", ""), profile) for w in seg_words)
+        seg_len = sum(_line_split_count(w.get("text", ""), profile) for w in seg_words)
         if seg_len <= max_chars:
             _emit_line(lines, seg_words)
         else:
@@ -209,8 +222,8 @@ def _smart_split(words: list, max_chars: int, profile: str) -> list[SubtitleLine
 def _find_valid_split_points(words: list, max_chars: int, profile: str) -> list[int]:
     valid = []
     for idx in range(1, len(words)):
-        left_len = sum(_line_unit_count(w.get("text", ""), profile) for w in words[:idx])
-        right_len = sum(_line_unit_count(w.get("text", ""), profile) for w in words[idx:])
+        left_len = sum(_line_split_count(w.get("text", ""), profile) for w in words[:idx])
+        right_len = sum(_line_split_count(w.get("text", ""), profile) for w in words[idx:])
         if left_len <= max_chars and right_len <= max_chars:
             valid.append(idx)
     return valid
@@ -238,13 +251,13 @@ def _split_score(words: list, split_idx: int, profile: str) -> float:
 
 
 def _find_best_force_split(words: list, max_chars: int, profile: str) -> int:
-    total_len = sum(_line_unit_count(w.get("text", ""), profile) for w in words)
+    total_len = sum(_line_split_count(w.get("text", ""), profile) for w in words)
     target = total_len / 2
     best_idx = 0
     best_score = float("inf")
     acc = 0.0
     for idx in range(1, len(words)):
-        acc += _line_unit_count(words[idx - 1].get("text", ""), profile)
+        acc += _line_split_count(words[idx - 1].get("text", ""), profile)
         if acc > max_chars:
             break
         score = abs(acc - target)
@@ -273,14 +286,14 @@ def _emit_line(lines: list[SubtitleLine], words: list) -> None:
 
 def _line_is_acceptable(line: SubtitleLine, max_chars: int, profile: str) -> bool:
     duration = float(line.end_time) - float(line.start_time)
-    content_units = _line_unit_count(line.text, profile)
-    if content_units > max_chars:
+    split_units = _line_split_count(line.text, profile)
+    if split_units > max_chars:
         return False
     if duration <= 0:
         return False
     if duration > _LINE_MAX_DURATION:
         return False
-    cps = content_units / duration
+    cps = _line_unit_count(line.text, profile) / duration
     if cps > _line_cps_threshold(line.text):
         return False
     return True
@@ -307,6 +320,7 @@ def _compact_lines(lines: list[SubtitleLine], max_chars: int, profile: str) -> l
     if len(lines) < 2:
         return lines
     current_lines = list(lines)
+    gap_limit = _ENGLISH_FRAGMENT_MERGE_GAP if profile == "english" else _FRAGMENT_MERGE_GAP
     while True:
         compacted: list[SubtitleLine] = []
         idx = 0
@@ -318,7 +332,7 @@ def _compact_lines(lines: list[SubtitleLine], max_chars: int, profile: str) -> l
                 gap = max(0.0, next_line.start_time - current.end_time)
                 merged = _merge_two_lines(current, next_line)
                 if (
-                    gap <= _FRAGMENT_MERGE_GAP
+                    gap <= gap_limit
                     and (_is_fragment_line(current, profile) or _is_fragment_line(next_line, profile))
                     and _line_is_acceptable(merged, max_chars, profile)
                 ):
@@ -331,6 +345,26 @@ def _compact_lines(lines: list[SubtitleLine], max_chars: int, profile: str) -> l
         if not merged_any:
             return compacted
         current_lines = compacted
+
+
+def _trim_incomplete_trailing_line(lines: list[SubtitleLine], audio_duration: float) -> list[SubtitleLine]:
+    if not lines or audio_duration <= 0:
+        return lines
+    last_line = lines[-1]
+    text = last_line.text.rstrip()
+    duration = float(last_line.end_time) - float(last_line.start_time)
+    word_count = len(last_line.words)
+    if not text:
+        return lines[:-1]
+    if duration >= 1.2:
+        return lines
+    if abs(float(last_line.end_time) - audio_duration) > 0.05:
+        return lines
+    if word_count >= 3:
+        return lines[:-1]
+    if _word_ends_with(text, _SENTENCE_END):
+        return lines
+    return lines[:-1]
 
 
 def stage3_fix(lines: list[SubtitleLine], fix_dir: str) -> list[SubtitleLine]:
@@ -368,7 +402,7 @@ def check_max_chars(lines: list[SubtitleLine], max_chars: int = 14) -> list[Chec
     errors = []
     for idx, line in enumerate(lines, start=1):
         profile = _detect_profile_from_words(line.words) if line.words else "cjk"
-        line_len = _line_unit_count(line.text, profile)
+        line_len = _line_split_count(line.text, profile)
         if line_len > max_chars:
             errors.append(
                 CheckError(
@@ -384,7 +418,7 @@ def _line_cps_threshold(text: str) -> float:
     ascii_alpha = sum(1 for ch in text if ch.isascii() and ch.isalpha())
     visible_chars = sum(1 for ch in text if not ch.isspace())
     non_ascii_visible = max(0, visible_chars - ascii_alpha)
-    return 20.0 if ascii_alpha > non_ascii_visible else 8.0
+    return _ENGLISH_CPS_THRESHOLD if ascii_alpha > non_ascii_visible else _CJK_CPS_THRESHOLD
 
 
 def _short_line_content_threshold(profile: str) -> float:

@@ -19,6 +19,7 @@ from scripts.asr.pipeline import (
     SubtitleLine as StandaloneSubtitleLine,
     _break_paragraph as standalone_break_paragraph,
     _build_paragraphs as standalone_build_paragraphs,
+    _trim_incomplete_trailing_line as standalone_trim_incomplete_trailing_line,
     _smart_split as standalone_smart_split,
     check_line_timing as standalone_check_line_timing,
     run_pipeline as standalone_run_pipeline,
@@ -563,11 +564,11 @@ class StandaloneAsrPipelineTests(unittest.TestCase):
     def test_smart_split_breaks_long_segment(self) -> None:
         lines = standalone_smart_split(
             [
-                {"text": "This ", "start_time": 0.0, "end_time": 0.2},
-                {"text": "is ", "start_time": 0.2, "end_time": 0.4},
-                {"text": "a ", "start_time": 0.4, "end_time": 0.6},
-                {"text": "long ", "start_time": 0.9, "end_time": 1.2},
-                {"text": "line", "start_time": 1.2, "end_time": 1.5},
+                {"text": "Extraordinary ", "start_time": 0.0, "end_time": 0.3},
+                {"text": "breaking ", "start_time": 0.3, "end_time": 0.6},
+                {"text": "news ", "start_time": 0.6, "end_time": 0.9},
+                {"text": "arrives ", "start_time": 1.2, "end_time": 1.5},
+                {"text": "suddenly", "start_time": 1.5, "end_time": 1.8},
             ],
             max_chars=8,
             profile="english",
@@ -589,6 +590,62 @@ class StandaloneAsrPipelineTests(unittest.TestCase):
 
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0].text, "Well, this works.")
+
+    def test_break_paragraph_keeps_weighted_english_line_together(self) -> None:
+        lines = standalone_break_paragraph(
+            standalone_build_paragraphs(
+                [
+                    {"text": "Langolier ", "start_time": 11.36, "end_time": 11.84},
+                    {"text": "is ", "start_time": 11.84, "end_time": 11.92},
+                    {"text": "one ", "start_time": 11.92, "end_time": 12.00},
+                    {"text": "of ", "start_time": 12.00, "end_time": 12.08},
+                    {"text": "the ", "start_time": 12.08, "end_time": 12.16},
+                    {"text": "best ", "start_time": 12.16, "end_time": 12.40},
+                    {"text": "hitters ", "start_time": 12.40, "end_time": 12.56},
+                    {"text": "since ", "start_time": 12.56, "end_time": 12.80},
+                    {"text": "the ", "start_time": 12.80, "end_time": 12.88},
+                    {"text": "AllStar ", "start_time": 12.88, "end_time": 13.20},
+                    {"text": "break ", "start_time": 13.20, "end_time": 13.52},
+                    {"text": "in ", "start_time": 13.52, "end_time": 13.60},
+                    {"text": "last ", "start_time": 13.60, "end_time": 13.92},
+                    {"text": "year. ", "start_time": 13.92, "end_time": 14.08},
+                ]
+            )[0],
+            max_chars=38,
+        )
+
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(
+            lines[0].text,
+            "Langolier is one of the best hitters since the AllStar break in last year. ",
+        )
+
+    def test_break_paragraph_merges_english_short_exclamation_with_pause(self) -> None:
+        lines = standalone_break_paragraph(
+            standalone_build_paragraphs(
+                [
+                    {"text": "The ", "start_time": 65.28, "end_time": 65.52},
+                    {"text": "opposite ", "start_time": 65.52, "end_time": 66.24},
+                    {"text": "way, ", "start_time": 66.24, "end_time": 67.52},
+                    {"text": "gone. ", "start_time": 68.16, "end_time": 68.24},
+                ]
+            )[0],
+            max_chars=38,
+        )
+
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].text, "The opposite way, gone. ")
+
+    def test_trim_incomplete_trailing_line_drops_short_clip_end_fragment(self) -> None:
+        lines = [
+            StandaloneSubtitleLine(text="Complete line. ", start_time=0.0, end_time=2.0),
+            StandaloneSubtitleLine(text="Cut off", start_time=9.2, end_time=10.0),
+        ]
+
+        trimmed = standalone_trim_incomplete_trailing_line(lines, audio_duration=10.0)
+
+        self.assertEqual(len(trimmed), 1)
+        self.assertEqual(trimmed[0].text, "Complete line. ")
 
     def test_split_line_after_splits_unique_text(self) -> None:
         lines = [
